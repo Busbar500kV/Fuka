@@ -1,230 +1,149 @@
-"""
-sim_core.py — minimal but functional engine + strong diagnostics.
-
-This file exposes:
-  - default_config (dict)
-  - Engine (class)
-  - make_engine(cfg) -> Engine
-
-It also includes diag_info() so the Streamlit app can print
-where this module was loaded from and what it exports.
-"""
-
 from __future__ import annotations
-
-import os
-import inspect
-import hashlib
-from dataclasses import dataclass, field
-from typing import Dict, List, Generator, Optional, Tuple
-
+import math, dataclasses
 import numpy as np
+import pandas as pd
 
+# -----------------------------------------------------------------------------
+# Defaults exposed for the UI
+# -----------------------------------------------------------------------------
+default_config = dict(
+    frames=1600,
+    space=192,
+    seed=0,
+    # simple environment controls
+    env_E0=2.0,     # base free energy
+    env_var=0.5,    # variance of local fluctuations
+    # growth / pruning knobs
+    grow_budget=10,
+    prune_tau=800,
+)
 
-# -----------------------
-# Public default config
-# -----------------------
-default_config: Dict[str, object] = {
-    "seed": 0,
-    "frames": 1600,
-    "space": 192,                # just a label here
-    "env_free_energy": 1.0,      # baseline environment energy
-    "dt": 1.0,                   # time step
-    "harvest_gain": 0.12,        # how strongly “motors” (currently implicit) harvest from env
-    "internal_gain": 0.06,       # internal redistribution gain
-    "cost_activity": 0.02,       # cost of being active
-    "cost_maintenance": 0.01,    # base maintenance cost
-    "noise_env": 0.15,           # environmental noise
-}
-
-
-# -----------------------------------
-# Diagnostic helpers for the UI
-# -----------------------------------
-def _short_hash(text: str, n: int = 10) -> str:
-    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:n]
-
-
-def diag_info() -> Dict[str, object]:
-    """Return details so the UI can show what this module actually is."""
-    here = os.path.abspath(__file__)
-    exported = sorted([n for n in globals().keys() if not n.startswith("_")])
-    try:
-        src = inspect.getsource(Engine)
-    except Exception:
-        src = ""
-    try:
-        src2 = inspect.getsource(make_engine)
-    except Exception:
-        src2 = ""
-    return {
-        "module_file": here,
-        "exported_symbols": exported,
-        "engine_exists": "Engine" in globals(),
-        "make_engine_exists": "make_engine" in globals(),
-        "default_config_exists": "default_config" in globals(),
-        "engine_source_hash": _short_hash(src) if src else None,
-        "factory_source_hash": _short_hash(src2) if src2 else None,
-    }
-
-
-# -----------------------------------
-# Minimal connection record (optional)
-# -----------------------------------
-@dataclass
+# -----------------------------------------------------------------------------
+# Minimal connection representation
+# -----------------------------------------------------------------------------
+@dataclasses.dataclass
 class Conn:
-    kind: str
-    L: float
-    T: float
-    active_frac: float = 0.0
-    energy_contrib: float = 0.0
+    kind: str        # "SENSE" | "INTERNAL" | "MOTOR"
+    ell: float       # spatial/event scale
+    h: float         # threshold-like internal scalar
     age: int = 0
 
-
-# -----------------------------------
-# The simulation engine
-# -----------------------------------
+# -----------------------------------------------------------------------------
+# Simple environment & engine (toy) to keep the app demonstrable
+# -----------------------------------------------------------------------------
 class Engine:
-    """
-    A simple, stable simulation loop so the app can run and we can
-    confirm imports. You can replace the internals later with your
-    full free-energy dynamics.
-    """
-
-    def __init__(self, cfg: Dict[str, object]):
+    def __init__(self, cfg: dict):
         self.cfg = dict(default_config)
         self.cfg.update(cfg or {})
+        self.rng = np.random.default_rng(self.cfg.get("seed", 0))
 
-        self.rng = np.random.default_rng(int(self.cfg.get("seed", 0)))
-        self.t: int = 0
+        # start with a small random set of connections, allow all three kinds
+        self.conns: list[Conn] = []
+        for k in ["SENSE", "INTERNAL", "MOTOR"]:
+            for _ in range(3):
+                self.conns.append(
+                    Conn(kind=k, ell=float(self.rng.uniform(0.1, 1.0)), h=float(self.rng.uniform(-0.1, 0.1)))
+                )
 
-        # A tiny set of “boundary” connections for the demo.
-        self.conns: List[Conn] = [
-            Conn("SENSE", L=0.95, T=0.0),
-            Conn("SENSE", L=0.85, T=0.0),
-            Conn("SENSE", L=1.02, T=0.0),
-        ]
+        # running state
+        self.t = 0
+        self.E = float(self.cfg["env_E0"])
+        self.S = 0.0
 
-        # Timeseries
-        self.time: List[int] = []
-        self.E_total: List[float] = []
-        self.E_env: List[float] = []
-        self.P_harvest: List[float] = []
-        self.Costs: List[float] = []
+    # a tiny “environment” — fluctuating free energy & structure
+    def environment_tick(self):
+        E0  = float(self.cfg["env_E0"])
+        var = float(self.cfg["env_var"])
+        dE  = self.rng.normal(0.0, var * 0.05)
+        self.E = max(0.0, E0 + dE + 0.5 * math.sin(0.005 * self.t))
+        # toy “entropy”: increases with noise; decreases when internals grow
+        self.S = max(0.0, var + 0.1 * math.sin(0.01 * self.t))
 
-        # State
-        self.energy_internal: float = 0.0
-        self.last_snapshot: Dict[str, object] = {}
+    # local harvest function per-connection (toy & bounded)
+    def harvest(self, c: Conn) -> float:
+        # SENSE harvest mostly from boundary E, MOTOR can funnel a bit more if E high,
+        # INTERNAL harvests from structure (S) & interactions in a weak way
+        if c.kind == "SENSE":
+            return 0.2 * self.E * (1.0 / (1.0 + abs(c.h)))
+        if c.kind == "MOTOR":
+            # motors benefit more from high E but pay a small activity cost (handled below)
+            return 0.3 * self.E * (1.0 / (1.0 + abs(c.h)))
+        # INTERNAL: small baseline; increases as entropy (structure) exists
+        return 0.05 * (self.E + self.S) * (1.0 / (1.0 + abs(c.h)))
 
-    # -----------------------------
-    # one time step
-    # -----------------------------
-    def step(self) -> None:
-        dt = float(self.cfg["dt"])
-        env_mean = float(self.cfg["env_free_energy"])
-        env_noise = float(self.cfg["noise_env"])
+    def activity_cost(self, c: Conn) -> float:
+        base = 0.01
+        if c.kind == "MOTOR":
+            base = 0.03
+        return base * (1.0 + c.ell)
 
-        # Environment free energy at boundary this step
-        E_env_t = max(0.0, env_mean + env_noise * self.rng.normal())
+    def maintenance_cost(self, c: Conn) -> float:
+        return 0.005 * (1.0 + c.ell)
 
-        # Harvesting (coarse placeholder)
-        h_gain = float(self.cfg["harvest_gain"])
-        # Simple “boundary intake” proportional to boundary L and env level:
-        boundary_intake = E_env_t * h_gain * sum(max(0.0, c.L) for c in self.conns) / len(self.conns)
+    def step(self):
+        self.environment_tick()
 
-        # Internal redistribution (lossy gain)
-        i_gain = float(self.cfg["internal_gain"])
-        internal_boost = i_gain * max(0.0, self.energy_internal)
-
-        # Costs
-        c_act = float(self.cfg["cost_activity"])
-        c_mai = float(self.cfg["cost_maintenance"])
-        # Activity cost increases with average activity fraction
-        act_frac = 0.0
-        if self.conns:
-            act_frac = np.clip(np.mean([c.active_frac for c in self.conns]), 0.0, 1.0)
-        cost_activity = c_act * act_frac
-        cost_maint = c_mai
-
-        net = (boundary_intake + internal_boost) - (cost_activity + cost_maint)
-        self.energy_internal += net * dt
-
-        # Update “activity” for each connection in a tiny way
+        # per-conn net contribution
+        contrib = []
         for c in self.conns:
-            # toy activity: more env energy => more active
-            c.active_frac = float(np.clip(0.5 * E_env_t, 0.0, 1.0))
-            c.energy_contrib = boundary_intake / max(1, len(self.conns))
+            P = self.harvest(c)
+            C = self.activity_cost(c) + self.maintenance_cost(c)
+            net = P - C
+            contrib.append(net)
             c.age += 1
 
-        # Bookkeeping
-        self.time.append(self.t)
-        self.E_total.append(self.energy_internal)
-        self.E_env.append(E_env_t)
-        self.P_harvest.append(boundary_intake)
-        self.Costs.append(cost_activity + cost_maint)
+            # plasticity (lightweight): small random walk toward reducing |h|
+            if self.rng.random() < 0.1:
+                c.h += float(self.rng.normal(0.0, 0.01)) * np.sign(-c.h)
+
+        # very small global adaptation: if E is high, grow motors; if S is high, grow internals;
+        # occasionally spawn sensors. This is just to make the demo lively.
+        if (self.t % 40) == 0:
+            budget = int(self.cfg.get("grow_budget", 10))
+            for _ in range(budget):
+                r = self.rng.random()
+                if r < 0.4:   # prefer motors when E is available
+                    self.conns.append(Conn("MOTOR", ell=float(self.rng.uniform(0.1, 1.0)), h=0.0))
+                elif r < 0.8: # internals fairly often
+                    self.conns.append(Conn("INTERNAL", ell=float(self.rng.uniform(0.1, 1.0)), h=0.0))
+                else:         # sometimes sensors
+                    self.conns.append(Conn("SENSE", ell=float(self.rng.uniform(0.1, 1.0)), h=0.0))
+
+        # pruning: remove oldest low-contributors with small probability
+        if (self.t % int(self.cfg.get("prune_tau", 800))) == 0 and self.t > 0:
+            # sort by contribution ascending and drop a few
+            idx = np.argsort(contrib)
+            drop = min(5, len(self.conns) // 10)
+            for i in idx[:drop]:
+                # guard bounds
+                j = max(0, min(len(self.conns) - 1, int(i)))
+                self.conns.pop(j)
+
+        # aggregate “system” free energy as a softplus of contributions to keep it finite
+        E_free = float(np.log1p(np.exp(np.clip(np.sum(contrib), -50, 50))))
         self.t += 1
 
-        # snapshot for the UI
-        self.last_snapshot = {
-            "t": self.t,
-            "E_internal": self.energy_internal,
-            "E_env": E_env_t,
-            "harvest": boundary_intake,
-            "costs": cost_activity + cost_maint,
-            "active_frac": act_frac,
-        }
+        # counts for the UI
+        n_sense    = sum(1 for c in self.conns if c.kind == "SENSE")
+        n_internal = sum(1 for c in self.conns if c.kind == "INTERNAL")
+        n_motor    = sum(1 for c in self.conns if c.kind == "MOTOR")
 
-    # -----------------------------
-    # multiple steps with yielding
-    # -----------------------------
-    def run(self, steps: int, yield_every: int = 20) -> Generator[Dict[str, object], None, None]:
-        for _ in range(steps):
-            self.step()
-            if yield_every > 0 and (self.t % yield_every == 0):
-                yield self.last_snapshot
+        return dict(
+            frame=self.t,
+            E=E_free,
+            S=self.S,
+            n_sense=n_sense,
+            n_internal=n_internal,
+            n_motor=n_motor,
+        )
 
-    # -----------------------------
-    # resets
-    # -----------------------------
-    def reset(self, seed: Optional[int] = None) -> None:
-        if seed is not None:
-            self.cfg["seed"] = int(seed)
-        self.__init__(self.cfg)
-
-    # -----------------------------
-    # simple dataframe-like dict
-    # -----------------------------
-    def connections_table(self) -> List[Dict[str, object]]:
+    def summary_table(self) -> pd.DataFrame:
         rows = []
-        for idx, c in enumerate(self.conns):
-            rows.append({
-                "index": idx,
-                "type": c.kind,
-                "L": c.L,
-                "T": c.T,
-                "Active_Frac": c.active_frac,
-                "Contribution_Energy": c.energy_contrib,
-                "Age": c.age,
-            })
-        return rows
-
-    # -----------------------------
-    # tiny summary
-    # -----------------------------
-    def summary(self) -> Dict[str, object]:
-        return {
-            "t": self.t,
-            "E_internal": self.energy_internal,
-            "last_env": self.E_env[-1] if self.E_env else None,
-            "num_conns": len(self.conns),
-        }
+        for i, c in enumerate(self.conns):
+            rows.append(dict(index=i, type=c.kind, L=c.ell, T=0.0, delay_tau=0.0, alpha_tau=0.0, Age=c.age))
+        return pd.DataFrame(rows)
 
 
-# ---------------
-# Public factory
-# ---------------
-def make_engine(cfg: Dict[str, object]):
+# Optional factory (exported so direct imports work if you really want them)
+def make_engine(cfg: dict) -> Engine:
     return Engine(cfg)
-
-
-__all__ = ["default_config", "Engine", "make_engine", "diag_info"]
