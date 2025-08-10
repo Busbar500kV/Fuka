@@ -1,219 +1,158 @@
 # sim_core.py
-# Fuka – minimal but stable engine with clear API + diagnostics
+# Minimal simulation core + simple “engine” to be driven by Streamlit.
+# Focus here is correctness & clean API (make_engine / Engine.run / Engine.curves).
+
 from __future__ import annotations
 
-from dataclasses import dataclass, asdict
+import math
+import time
+from dataclasses import dataclass
 from typing import Callable, Dict, Optional
+
 import numpy as np
+import pandas as pd
 
-__all__ = [
-    "Config",
-    "default_config",
-    "Engine",
-    "make_engine",
-]
-
-# --------------------
-# Configuration object
-# --------------------
-@dataclass
-class Config:
-    frames: int = 1600
-    space: int = 192
-    seed: int = 0
-
-    # environment & energy
-    env_power: float = 1.0        # baseline free energy in the environment
-    env_hotspots: int = 6         # moving “energy rays”
-    env_decay: float = 0.985      # how quickly environment diffuses per step
-    pool_init: float = 50.0       # initial intracellular energy
-
-    # connections (kept simple—role emerges from drive mix)
-    n_conns: int = 12
-    act_cost: float = 0.02        # cost paid when a conn activates
-    main_cost: float = 0.001      # base upkeep
-
-    # drives (relative weights used to turn activation into harvest)
-    w_direct: float = 1.0         # “sensor-like” drive from environment mismatch
-    w_indirect: float = 0.6       # “internal-like” drive from substrate mismatch
-    w_motor: float = 0.8          # “motor-like” drive that changes environment
-
-    # stability guards
-    clip_energy: float = 1e6
-    dt: float = 1.0               # one tick per frame
 
 def default_config() -> Dict:
-    """Return a plain dict so Streamlit widgets can mutate it easily."""
-    return asdict(Config())
+    return {
+        "frames": 1600,     # total ticks
+        "space": 192,       # spatial DOF
+        "seed": 0,
+        "env_level": 1.0,   # environment free-energy scale
+        "motor_bias": 0.2,  # relative tendency toward “motor-like” action
+        "internal_bias": 0.2,
+        "sense_bias": 0.6,
+        "chunk": 25,        # streaming redraw interval
+        "sleep_ms": 0,      # artificial slowdown for streaming (0 = none)
+    }
 
 
-# -------------
-# Core engine
-# -------------
+@dataclass
 class Engine:
-    """
-    Extremely compact simulation:
-      - 1D space with an environment field E[t, x] carrying free energy.
-      - A substrate S[t, x] inside the ‘cell’ that can absorb/emit energy.
-      - A small set of generic connections whose activation is driven by
-        local mismatches; their ‘role’ (sensor/internal/motor) is emergent.
-    """
+    cfg: Dict
+    rng: np.random.Generator
+    t: int
+    curves: Dict[str, np.ndarray]
+    info: Dict
 
     def __init__(self, cfg: Dict):
-        self.cfg = Config(**cfg) if isinstance(cfg, dict) else cfg
-        self.rng = np.random.default_rng(self.cfg.seed)
+        self.cfg = dict(cfg)
+        self.rng = np.random.default_rng(int(self.cfg.get("seed", 0)))
+        T = int(self.cfg.get("frames", 1000))
+        N = int(self.cfg.get("space", 128))
 
-        T = self.cfg.frames
-        X = self.cfg.space
-        C = self.cfg.n_conns
+        # Curves we’ll expose to the UI
+        self.curves = {
+            "E_env": np.zeros(T, dtype=float),     # environment free energy
+            "E_cell": np.zeros(T, dtype=float),    # internal/pool energy
+            "E_flux": np.zeros(T, dtype=float),    # net flux into the cell
+            "Sense": np.zeros(T, dtype=float),
+            "Motor": np.zeros(T, dtype=float),
+            "Internal": np.zeros(T, dtype=float),
+        }
+        self.info = {"space": N, "frames": T}
+        self.t = 0
 
-        # State history buffers
-        self.energy = np.full(T, np.nan, dtype=np.float64)
-        self.env = np.zeros((T, X), dtype=np.float64)
-        self.subs = np.zeros((T, X), dtype=np.float64)
-        self.act = np.zeros((T, C), dtype=np.float64)  # activation per connection
+        # Internal “state”
+        self._E = float(self.cfg.get("env_level", 1.0))  # environment level
+        self._Cell = 0.1                                 # internal energy pool
+        self._s = 0.0                                    # “sensor pressure”
+        self._m = 0.0                                    # “motor pressure”
+        self._i = 0.0                                    # “internal pressure”
 
-        # Init
-        self.energy[0] = float(self.cfg.pool_init)
-        self._init_environment(self.env[0])
-        self.subs[0] = 0.0
+        # Pre-build a smooth environment signal (no trig; smoothed noise)
+        # start at env_level and wander via clipped random walk
+        drift = self.rng.normal(0.0, 0.05, size=T)
+        env = np.empty(T, dtype=float)
+        level = float(self.cfg.get("env_level", 1.0))
+        for k in range(T):
+            level = level + 0.25 * drift[k]
+            # squash into a positive band ~[0, 2] using softplus-like mapping
+            # softplus(x) ~ log(1 + exp(x)); here we just clamp to keep finite
+            level = float(np.clip(level, -3.0, 3.0))
+            env[k] = math.log1p(math.exp(level))  # always > 0, smooth
+        # normalize so mean ≈ env_level
+        scale = float(self.cfg.get("env_level", 1.0)) / (env.mean() + 1e-9)
+        env *= scale
+        self._env_traj = env
 
-        # Per‑connection location & phase (space-time “event” style)
-        self.c_pos = self.rng.integers(0, X, size=C)
-        self.c_phase = self.rng.random(C) * 2.0 * np.pi
-        self.c_speed = self.rng.uniform(0.2, 1.0, size=C)  # how fast they “sweep”
+    def _step_dynamics(self, t: int):
+        """
+        One tick of very simple, numerically-stable dynamics.
+        We model:
+          - E_env[t] from a smoothed random walk (precomputed)
+          - Flux into cell depends on Motor (exploit/env-explore) + Sense (efficient capture)
+          - Internal acts like catalytic structuring that increases efficiency over time
+        All terms are small and bounded to avoid overflow.
+        """
+        # Read environment at t
+        E_env = float(self._env_traj[t])
 
-        # Simple kernels so nothing explodes
-        self._env_kernel = np.exp(-((np.arange(-6, 7)) ** 2) / 12.0)
-        self._env_kernel /= self._env_kernel.sum()
+        # small random nudges to “pressures”
+        self._m += 0.02 * (self.cfg["motor_bias"] - self._m) + 0.01 * self.rng.normal()
+        self._s += 0.02 * (self.cfg["sense_bias"] - self._s) + 0.01 * self.rng.normal()
+        self._i += 0.02 * (self.cfg["internal_bias"] - self._i) + 0.01 * self.rng.normal()
 
-        self._t = 0  # current frame
+        # keep them bounded
+        self._m = float(np.clip(self._m, 0.0, 1.0))
+        self._s = float(np.clip(self._s, 0.0, 1.0))
+        self._i = float(np.clip(self._i, 0.0, 1.0))
 
-    # -- Environment set up
-    def _init_environment(self, env_x: np.ndarray) -> None:
-        X = env_x.shape[0]
-        env_x[:] = 0.0
-        # place a few initial hotspots
-        idx = self.rng.choice(X, size=max(1, self.cfg.env_hotspots // 2), replace=False)
-        env_x[idx] = self.cfg.env_power * 4.0
+        # Efficiency rises with structure (internal) and sensing
+        eff = 0.15 + 0.5 * self._s + 0.35 * self._i
+        eff = float(np.clip(eff, 0.05, 0.98))
 
-    def _advance_environment(self, t: int) -> None:
-        """Create smooth moving ‘rays’ of free energy, diffusing a bit."""
-        E_prev = self.env[t - 1]
-        X = E_prev.shape[0]
+        # “Reach” rises with motor pressure but has diminishing returns
+        reach = 0.1 + 0.8 * (1.0 - math.exp(-2.0 * self._m))
+        reach = float(np.clip(reach, 0.05, 0.95))
 
-        # diffuse/decay
-        E = self.cfg.env_decay * E_prev.copy()
+        # Flux is product of available env, reach, and efficiency
+        flux = E_env * reach * eff
 
-        # inject moving rays at deterministic angles (no trig used)
-        # We emulate diagonal motion by cyclically shifting short pulses.
-        n_rays = self.cfg.env_hotspots
-        stride = max(3, X // (n_rays + 1))
-        for r in range(n_rays):
-            base = (r * stride + (t * (r + 1))) % X
-            E[base] += self.cfg.env_power * (1.0 + 0.2 * ((r + t) % 3))
+        # Internal maintenance + mild leakage
+        maintenance = 0.02 + 0.02 * (self._Cell)
+        leak = 0.015 * self._Cell
 
-        # smooth via tiny convolution to keep things sane
-        E = np.convolve(
-            np.pad(E, (6, 6), mode="wrap"), self._env_kernel, mode="valid"
-        )
+        # Update cell energy (never below 0)
+        dE = flux - (maintenance + leak)
+        self._Cell = float(max(0.0, self._Cell + dE))
 
-        self.env[t] = E
+        # Save curves
+        self.curves["E_env"][t] = E_env
+        self.curves["E_cell"][t] = self._Cell
+        self.curves["E_flux"][t] = dE
+        self.curves["Sense"][t] = self._s
+        self.curves["Motor"][t] = self._m
+        self.curves["Internal"][t] = self._i
 
-    # -- One simulation step
-    def _step(self, t: int) -> None:
-        cfg = self.cfg
-        X = cfg.space
-        C = cfg.n_conns
-
-        # 1) advance environment
-        self._advance_environment(t)
-
-        # 2) compute local mismatches
-        env_t = self.env[t]
-        subs_prev = self.subs[t - 1]
-        # mismatch w.r.t. zero for substrate (want to equalize), and env drives
-        d_env = env_t - subs_prev
-        d_sub = -(subs_prev - subs_prev.mean())
-
-        # 3) connection activation (purely local; 0..1)
-        # each connection samples a small window around its position
-        a = np.zeros(C, dtype=np.float64)
-        for k in range(C):
-            # event-like wandering of connection along space
-            self.c_pos[k] = (self.c_pos[k] + int(self.c_speed[k])) % X
-
-            i = self.c_pos[k]
-            j0 = (i - 2) % X
-            j1 = (i + 3) % X
-            if j0 < j1:
-                local_env = d_env[j0:j1]
-                local_sub = d_sub[j0:j1]
-            else:
-                local_env = np.concatenate([d_env[j0:], d_env[:j1]])
-                local_sub = np.concatenate([d_sub[j0:], d_sub[:j1]])
-
-            # bounded, simple “softplus-like” without overflow
-            def softplus_bounded(x: np.ndarray) -> float:
-                x = np.clip(x, -20.0, 20.0)
-                return float(np.log1p(np.exp(x)).mean())
-
-            drive = (
-                cfg.w_direct * softplus_bounded(local_env)
-                + cfg.w_indirect * softplus_bounded(local_sub)
-            )
-            # slight “motor” bias to push substrate towards env where active
-            motor = cfg.w_motor * softplus_bounded(local_env - local_sub)
-
-            # convert to bounded activation
-            a[k] = np.tanh(0.2 * (drive + 0.5 * motor))
-
-        # 4) harvest vs cost
-        # harvest from better env/subs match; costs for activity and upkeep
-        harvest = 0.02 * a.sum() * float(np.maximum(d_env.var(), 1e-6))
-        cost = cfg.main_cost * C + cfg.act_cost * (a > 0.05).sum()
-
-        # 5) update substrate towards environment using activations as pumps
-        subs_t = subs_prev.copy()
-        # local pumps “pull” towards env where active
-        for k in range(C):
-            i = self.c_pos[k]
-            j0 = (i - 1) % X
-            j1 = (i + 2) % X
-            if j0 < j1:
-                region = slice(j0, j1)
-                subs_t[region] += 0.05 * a[k] * (env_t[region] - subs_t[region])
-            else:
-                idx = np.r_[np.arange(j0, X), np.arange(0, j1)]
-                subs_t[idx] += 0.05 * a[k] * (env_t[idx] - subs_t[idx])
-
-        # write state
-        self.subs[t] = subs_t
-        self.act[t] = a
-
-        # 6) energy pool
-        self.energy[t] = np.clip(
-            self.energy[t - 1] + harvest - cost, -cfg.clip_energy, cfg.clip_energy
-        )
-
-    # -- Public API
-    def run(self, progress_cb: Optional[Callable[[int], None]] = None) -> None:
-        T = self.cfg.frames
-        for t in range(1, T):
-            self._step(t)
-            self._t = t
-            if progress_cb and (t % 10 == 0 or t == T - 1):
+    def run(self, progress_cb: Optional[Callable[[int], None]] = None):
+        T = self.info["frames"]
+        sleep_ms = int(self.cfg.get("sleep_ms", 0))
+        for t in range(T):
+            self._step_dynamics(t)
+            self.t = t
+            if progress_cb is not None:
                 progress_cb(t)
+            if sleep_ms > 0:
+                time.sleep(sleep_ms / 1000.0)
 
-    def snapshots(self) -> Dict[str, np.ndarray]:
-        return dict(
-            energy=self.energy.copy(),
-            env=self.env.copy(),
-            subs=self.subs.copy(),
-            act=self.act.copy(),
-        )
+    # convenience for UI
+    def curves_frame(self, upto: Optional[int] = None) -> pd.DataFrame:
+        if upto is None:
+            upto = self.t
+        upto = max(0, min(int(upto), self.info["frames"] - 1))
+        data = {
+            "tick": np.arange(upto + 1),
+            "E_env": self.curves["E_env"][:upto + 1],
+            "E_cell": self.curves["E_cell"][:upto + 1],
+            "E_flux": self.curves["E_flux"][:upto + 1],
+            "Sense": self.curves["Sense"][:upto + 1],
+            "Motor": self.curves["Motor"][:upto + 1],
+            "Internal": self.curves["Internal"][:upto + 1],
+        }
+        return pd.DataFrame(data)
 
 
 def make_engine(cfg: Dict) -> Engine:
-    """Factory used by the Streamlit app."""
+    """Factory kept separate so the app can import it reliably."""
     return Engine(cfg)
