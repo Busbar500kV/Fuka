@@ -5,7 +5,7 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-from sim_core import default_config, make_engine
+# from sim_core import default_config, make_engine
 # top of app.py
 from sim_core import default_config, Engine
 
