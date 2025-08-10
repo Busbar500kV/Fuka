@@ -1,135 +1,164 @@
+# app.py
+# Streamlit UI with strong diagnostics + live streaming plots
 from __future__ import annotations
 
-import time
+import importlib
+from pathlib import Path
+from typing import Dict
+
 import numpy as np
-import pandas as pd
 import streamlit as st
 import matplotlib.pyplot as plt
-import importlib
 
-# -----------------------------------------------------------------------------
-# Import module ONLY; do not import names directly
-# -----------------------------------------------------------------------------
-import sim_core as sc  # this must succeed, or the app cannot run
+# --- Attempt import and show diagnostics early ---
+st.set_page_config(page_title="Fuka: Free‑Energy Simulation", layout="wide")
 
-# Resolve symbols with safe fallbacks + diagnostics
-default_config = getattr(sc, "default_config", None)
-Engine         = getattr(sc, "Engine", None)
-make_engine    = getattr(sc, "make_engine", None)
+import sim_core as sc  # whatever Streamlit actually loads
 
-# If make_engine is missing but Engine exists, provide a wrapper
-if make_engine is None and Engine is not None:
-    def make_engine(cfg):  # type: ignore
-        return Engine(cfg)
+# Pretty diagnostics
+with st.sidebar:
+    st.subheader("Module diagnostics")
+    st.caption(f"sim_core file path: `{getattr(sc, '__file__', '<none>')}`")
+    exports = sorted([k for k in dir(sc) if not k.startswith("_")])[:100]
+    st.caption("Available symbols: " + ", ".join(exports))
 
-# If anything critical is missing, surface helpful info and stop
-missing = []
-if default_config is None: missing.append("default_config")
-if make_engine is None and Engine is None: missing.append("Engine/make_engine")
+    if st.button("Force reload sim_core"):
+        importlib.invalidate_caches()
+        sc = importlib.reload(sc)
+        st.success("Reloaded sim_core. Press Rerun (top-right).")
 
-if missing:
-    st.error("`sim_core` was imported but does not expose the required names.")
-    st.write("Imported from:", getattr(sc, "__file__", "(no __file__)"))
-    st.write("Available symbols:", [n for n in dir(sc) if not n.startswith("_")])
+# Import required names (or show a friendly message & stop)
+MISSING = []
+try:
+    from sim_core import default_config, make_engine, Engine  # type: ignore
+except Exception:
+    # discover which ones are missing
+    try:
+        from sim_core import default_config  # type: ignore
+    except Exception:
+        MISSING.append("default_config")
+    try:
+        from sim_core import make_engine  # type: ignore
+    except Exception:
+        MISSING.append("make_engine")
+    try:
+        from sim_core import Engine  # type: ignore
+    except Exception:
+        MISSING.append("Engine")
+
+if MISSING:
+    st.error(
+        "sim_core was imported but does not expose the required names.\n\n"
+        f"Missing: {', '.join(MISSING)}\n\n"
+        "Did you push the latest `sim_core.py` and restart the app?"
+    )
+    # show head of the file to help verify
+    try:
+        head = "\n".join(Path(sc.__file__).read_text(encoding="utf-8").splitlines()[:80])
+        with st.expander("sim_core.py (first 80 lines)"):
+            st.code(head, language="python")
+    except Exception:
+        pass
     st.stop()
 
-# -----------------------------------------------------------------------------
-# Streamlit page config
-# -----------------------------------------------------------------------------
-st.set_page_config(page_title="Fuka: Free‑Energy Simulation", layout="wide")
-st.title("Fuka — Free‑Energy Simulation")
+# -------------------------
+# UI controls
+# -------------------------
+st.title("Fuka: Free‑Energy Simulation")
 
-# -----------------------------------------------------------------------------
-# Sidebar controls
-# -----------------------------------------------------------------------------
+cfg: Dict = default_config()
+
 with st.sidebar:
-    st.header("Run Settings")
-
-    # Start with defaults from sim_core.py but allow edits
-    cfg = dict(default_config)
-
-    frames = st.number_input("Frames per run", min_value=100, max_value=20000, value=cfg.get("frames", 1600), step=200)
-    space  = st.number_input("Space (N_s)",     min_value=8,   max_value=2048,  value=cfg.get("space", 192), step=8)
-    seed   = st.number_input("Seed",            min_value=0,   max_value=1_000_000, value=cfg.get("seed", 0), step=1)
-
-    # Environment sliders
-    env_E0  = st.slider("Env energy E0", 0.0,  10.0, float(cfg.get("env_E0", 2.0)), 0.1)
-    env_var = st.slider("Env variance",  0.0,   5.0, float(cfg.get("env_var", 0.5)), 0.1)
-
-    # Mutation / growth
-    grow_budget = st.number_input("Grow budget per epoch", 0, 200, cfg.get("grow_budget", 10), 1)
-    prune_tau   = st.slider("Prune time constant", 10, 5000, int(cfg.get("prune_tau", 800)), 10)
-
-    # Apply to cfg
-    cfg.update(
-        frames=int(frames),
-        space=int(space),
-        seed=int(seed),
-        env_E0=float(env_E0),
-        env_var=float(env_var),
-        grow_budget=int(grow_budget),
-        prune_tau=int(prune_tau),
+    st.subheader("Run settings")
+    cfg["frames"] = int(
+        st.number_input("Frames", min_value=200, max_value=20000, value=cfg["frames"], step=200)
     )
+    cfg["space"] = int(
+        st.number_input("Space (1D sites)", min_value=32, max_value=1024, value=cfg["space"], step=32)
+    )
+    cfg["n_conns"] = int(st.number_input("Connections", 3, 128, cfg["n_conns"], 1))
+    cfg["seed"] = int(st.number_input("Seed", 0, 10_000, cfg["seed"], 1))
+    st.divider()
+    st.subheader("Environment")
+    cfg["env_power"] = float(st.number_input("Env power", 0.0, 10.0, cfg["env_power"], 0.1))
+    cfg["env_hotspots"] = int(st.number_input("Env rays", 1, 32, cfg["env_hotspots"], 1))
+    cfg["env_decay"] = float(st.slider("Env decay", 0.90, 0.999, float(cfg["env_decay"]), 0.001))
+    st.divider()
+    st.subheader("Energy & Costs")
+    cfg["pool_init"] = float(st.number_input("Initial energy", -1_000.0, 1_000.0, cfg["pool_init"], 10.0))
+    cfg["act_cost"] = float(st.number_input("Activation cost", 0.0, 0.2, cfg["act_cost"], 0.005))
+    cfg["main_cost"] = float(st.number_input("Maintenance cost", 0.0, 0.01, cfg["main_cost"], 0.0005))
+    st.divider()
+    st.subheader("Drive weights")
+    cfg["w_direct"] = float(st.slider("Direct weight", 0.0, 2.0, float(cfg["w_direct"]), 0.05))
+    cfg["w_indirect"] = float(st.slider("Indirect weight", 0.0, 2.0, float(cfg["w_indirect"]), 0.05))
+    cfg["w_motor"] = float(st.slider("Motor weight", 0.0, 2.0, float(cfg["w_motor"]), 0.05))
 
-    run_btn = st.button("Run")
+    live_mode = st.checkbox("Live stream while running", value=True)
+    chunk = int(st.number_input("Stream every N steps", 5, 200, 20, 5))
 
-# -----------------------------------------------------------------------------
-# Main run
-# -----------------------------------------------------------------------------
-status = st.empty()
-col1, col2 = st.columns(2)
-chart_energy = col1.empty()
-chart_counts = col2.empty()
-table_final  = st.empty()
+run_btn = st.button("Run simulation", type="primary")
 
+# -------------------------
+# Runner
+# -------------------------
 if run_btn:
-    status.info("Initializing engine…")
-    eng = make_engine(cfg)
+    st.success("Starting…")
+    engine = make_engine(cfg)
 
-    E_hist, S_hist = [], []
-    n_sense_hist, n_internal_hist, n_motor_hist = [], [], []
+    # layout
+    col1, col2 = st.columns([1, 1])
+    energy_chart = col1.line_chart({"energy": [engine.energy[0]]})
+    env_fig = col2.empty()
+    subs_fig = col1.empty()
+    act_fig = col2.empty()
+    prog = st.progress(0, text="Running…")
 
-    # Run the requested frames
-    for f in range(cfg["frames"]):
-        out = eng.step()  # one tick
+    def redraw(t_now: int):
+        if not live_mode:
+            return
+        T = t_now + 1
+        # energy
+        energy_chart.add_rows({"energy": engine.energy[:T]})
 
-        # Track simple diagnostics
-        E_hist.append(out["E"])
-        S_hist.append(out["S"])
-        n_sense_hist.append(out["n_sense"])
-        n_internal_hist.append(out["n_internal"])
-        n_motor_hist.append(out["n_motor"])
+        # env heatmap
+        fig1, ax1 = plt.subplots(figsize=(6, 3))
+        im1 = ax1.imshow(engine.env[:T].T, aspect="auto", origin="lower")
+        ax1.set_title("Environment")
+        ax1.set_xlabel("frame"); ax1.set_ylabel("space")
+        plt.colorbar(im1, ax=ax1, fraction=0.046, pad=0.04)
+        env_fig.pyplot(fig1); plt.close(fig1)
 
-        # Update charts intermittently for responsiveness
-        if (f % 50 == 0) or (f == cfg["frames"] - 1):
-            # Energy chart
-            fig1, ax1 = plt.subplots()
-            ax1.plot(E_hist, label="Free Energy")
-            ax1.plot(S_hist, label="Entropy")
-            ax1.set_title("Energy / Entropy")
-            ax1.legend()
-            chart_energy.pyplot(fig1)
-            plt.close(fig1)
+        # substrate heatmap
+        fig2, ax2 = plt.subplots(figsize=(6, 3))
+        im2 = ax2.imshow(engine.subs[:T].T, aspect="auto", origin="lower", cmap="magma")
+        ax2.set_title("Substrate")
+        ax2.set_xlabel("frame"); ax2.set_ylabel("space")
+        plt.colorbar(im2, ax=ax2, fraction=0.046, pad=0.04)
+        subs_fig.pyplot(fig2); plt.close(fig2)
 
-            # Counts chart
-            fig2, ax2 = plt.subplots()
-            ax2.plot(n_sense_hist, label="SENSE")
-            ax2.plot(n_internal_hist, label="INTERNAL")
-            ax2.plot(n_motor_hist, label="MOTOR")
-            ax2.set_title("Connection Counts")
-            ax2.legend()
-            chart_counts.pyplot(fig2)
-            plt.close(fig2)
+        # activations (connections × time)
+        fig3, ax3 = plt.subplots(figsize=(6, 3))
+        im3 = ax3.imshow(engine.act[:T].T, aspect="auto", origin="lower", cmap="viridis")
+        ax3.set_title("Connection activations")
+        ax3.set_xlabel("frame"); ax3.set_ylabel("connection idx")
+        plt.colorbar(im3, ax=ax3, fraction=0.046, pad=0.04)
+        act_fig.pyplot(fig3); plt.close(fig3)
 
-            status.info(f"Running… frame {f+1}/{cfg['frames']}")
+        prog.progress(min(1.0, T / cfg["frames"]), text=f"Running… {T}/{cfg['frames']}")
 
-    status.success("Done!")
+    # run with streaming
+    if live_mode:
+        last = 0
+        def cb(t):
+            nonlocal last
+            if t - last >= chunk or t == cfg["frames"] - 1:
+                last = t
+                redraw(t)
+        engine.run(progress_cb=cb)
+        redraw(cfg["frames"] - 1)
+    else:
+        engine.run(progress_cb=None)
+        redraw(cfg["frames"] - 1)
 
-    # Final connection table
-    df = eng.summary_table()
-    table_final.dataframe(df)
-
-# Footer diagnostics
-with st.expander("Diagnostics"):
-    st.write("sim_core file:", getattr(sc, "__file__", "(no __file__)"))
-    st.write("Exports present:", [n for n in dir(sc) if not n.startswith("_")])
+    st.success("Done!")
