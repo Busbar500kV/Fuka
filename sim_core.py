@@ -159,3 +159,5 @@ class Engine:
 # convenience factory (used by the app)
 def make_engine(cfg: dict):
     return Engine(cfg)
+
+__all__ = ["default_config", "Engine", "make_engine"]
