@@ -1,164 +1,131 @@
 # app.py
-# Streamlit UI with strong diagnostics + live streaming plots
+# Streamlit UI that drives sim_core.Engine with safe streaming updates.
+
 from __future__ import annotations
 
 import importlib
+import os
 from pathlib import Path
 from typing import Dict
 
-import numpy as np
+import pandas as pd
 import streamlit as st
-import matplotlib.pyplot as plt
 
-# --- Attempt import and show diagnostics early ---
+# --- Import sim_core safely and show diagnostics so we know what got loaded ---
+import sim_core as sc  # module
+from sim_core import make_engine, default_config, Engine  # symbols
+
 st.set_page_config(page_title="Fuka: Free‑Energy Simulation", layout="wide")
 
-import sim_core as sc  # whatever Streamlit actually loads
+st.title("Fuka – Free‑Energy Gradient Simulation (Live)")
+st.caption("Continuous run with on-the-fly plotting. No nonlocal, no syntax traps.")
 
-# Pretty diagnostics
+# ----- Sidebar controls -------------------------------------------------------
 with st.sidebar:
-    st.subheader("Module diagnostics")
-    st.caption(f"sim_core file path: `{getattr(sc, '__file__', '<none>')}`")
-    exports = sorted([k for k in dir(sc) if not k.startswith("_")])[:100]
-    st.caption("Available symbols: " + ", ".join(exports))
+    st.header("Parameters")
+    cfg: Dict = default_config()
 
-    if st.button("Force reload sim_core"):
-        importlib.invalidate_caches()
-        sc = importlib.reload(sc)
-        st.success("Reloaded sim_core. Press Rerun (top-right).")
+    # Guardrails for min/max to avoid Streamlit's 'below min' errors
+    frames_min, frames_max, frames_step = 200, 20000, 100
+    space_min, space_max = 32, 1024
 
-# Import required names (or show a friendly message & stop)
-MISSING = []
-try:
-    from sim_core import default_config, make_engine, Engine  # type: ignore
-except Exception:
-    # discover which ones are missing
-    try:
-        from sim_core import default_config  # type: ignore
-    except Exception:
-        MISSING.append("default_config")
-    try:
-        from sim_core import make_engine  # type: ignore
-    except Exception:
-        MISSING.append("make_engine")
-    try:
-        from sim_core import Engine  # type: ignore
-    except Exception:
-        MISSING.append("Engine")
-
-if MISSING:
-    st.error(
-        "sim_core was imported but does not expose the required names.\n\n"
-        f"Missing: {', '.join(MISSING)}\n\n"
-        "Did you push the latest `sim_core.py` and restart the app?"
-    )
-    # show head of the file to help verify
-    try:
-        head = "\n".join(Path(sc.__file__).read_text(encoding="utf-8").splitlines()[:80])
-        with st.expander("sim_core.py (first 80 lines)"):
-            st.code(head, language="python")
-    except Exception:
-        pass
-    st.stop()
-
-# -------------------------
-# UI controls
-# -------------------------
-st.title("Fuka: Free‑Energy Simulation")
-
-cfg: Dict = default_config()
-
-with st.sidebar:
-    st.subheader("Run settings")
     cfg["frames"] = int(
-        st.number_input("Frames", min_value=200, max_value=20000, value=cfg["frames"], step=200)
+        st.number_input("Frames", min_value=frames_min, max_value=frames_max,
+                        value=int(cfg["frames"]), step=frames_step)
     )
     cfg["space"] = int(
-        st.number_input("Space (1D sites)", min_value=32, max_value=1024, value=cfg["space"], step=32)
+        st.number_input("Space (DOF)", min_value=space_min, max_value=space_max,
+                        value=int(cfg["space"]), step=32)
     )
-    cfg["n_conns"] = int(st.number_input("Connections", 3, 128, cfg["n_conns"], 1))
-    cfg["seed"] = int(st.number_input("Seed", 0, 10_000, cfg["seed"], 1))
-    st.divider()
-    st.subheader("Environment")
-    cfg["env_power"] = float(st.number_input("Env power", 0.0, 10.0, cfg["env_power"], 0.1))
-    cfg["env_hotspots"] = int(st.number_input("Env rays", 1, 32, cfg["env_hotspots"], 1))
-    cfg["env_decay"] = float(st.slider("Env decay", 0.90, 0.999, float(cfg["env_decay"]), 0.001))
-    st.divider()
-    st.subheader("Energy & Costs")
-    cfg["pool_init"] = float(st.number_input("Initial energy", -1_000.0, 1_000.0, cfg["pool_init"], 10.0))
-    cfg["act_cost"] = float(st.number_input("Activation cost", 0.0, 0.2, cfg["act_cost"], 0.005))
-    cfg["main_cost"] = float(st.number_input("Maintenance cost", 0.0, 0.01, cfg["main_cost"], 0.0005))
-    st.divider()
-    st.subheader("Drive weights")
-    cfg["w_direct"] = float(st.slider("Direct weight", 0.0, 2.0, float(cfg["w_direct"]), 0.05))
-    cfg["w_indirect"] = float(st.slider("Indirect weight", 0.0, 2.0, float(cfg["w_indirect"]), 0.05))
-    cfg["w_motor"] = float(st.slider("Motor weight", 0.0, 2.0, float(cfg["w_motor"]), 0.05))
+    cfg["seed"] = int(st.number_input("Seed", min_value=0, max_value=1_000_000,
+                                      value=int(cfg["seed"]), step=1))
 
-    live_mode = st.checkbox("Live stream while running", value=True)
-    chunk = int(st.number_input("Stream every N steps", 5, 200, 20, 5))
+    st.markdown("**Free‑energy & tendencies**")
+    cfg["env_level"] = float(st.slider("Environment level", 0.05, 5.0, float(cfg["env_level"]), 0.05))
+    cfg["sense_bias"] = float(st.slider("Sense bias", 0.0, 1.0, float(cfg["sense_bias"]), 0.01))
+    cfg["motor_bias"] = float(st.slider("Motor bias", 0.0, 1.0, float(cfg["motor_bias"]), 0.01))
+    cfg["internal_bias"] = float(st.slider("Internal bias", 0.0, 1.0, float(cfg["internal_bias"]), 0.01))
 
-run_btn = st.button("Run simulation", type="primary")
+    st.markdown("**Live mode**")
+    live_mode = st.checkbox("Live streaming (update during run)", value=True)
+    cfg["chunk"] = int(st.number_input("Redraw every N ticks", min_value=1, max_value=500,
+                                       value=int(cfg["chunk"]), step=1))
+    cfg["sleep_ms"] = int(st.number_input("Artificial delay per tick (ms)", min_value=0, max_value=50,
+                                          value=int(cfg.get("sleep_ms", 0)), step=1))
 
-# -------------------------
-# Runner
-# -------------------------
+    run_btn = st.button("Run simulation", type="primary", use_container_width=True)
+
+    st.divider()
+    st.markdown("**Import diagnostics**")
+    st.code(
+        f"sim_core path: {Path(sc.__file__).as_posix()}\n"
+        f"has make_engine: {hasattr(sc, 'make_engine')}\n"
+        f"has Engine:      {hasattr(sc, 'Engine')}\n"
+        f"default_config(): {default_config().__class__.__name__}",
+        language="text",
+    )
+
+# ----- Placeholders for outputs ----------------------------------------------
+col_top, col_bot = st.columns([2, 1], gap="large")
+with col_top:
+    status = st.empty()
+    chart = st.empty()
+with col_bot:
+    table_box = st.empty()
+
+log_box = st.expander("Event log", expanded=False)
+log_area = log_box.empty()
+
+# ----- Helpers ----------------------------------------------------------------
+def redraw(engine: Engine, t: int):
+    """Update chart + table safely up to tick t."""
+    df = engine.curves_frame(upto=t)
+    if not df.empty:
+        # Energy chart
+        chart.line_chart(
+            df.set_index("tick")[["E_env", "E_cell", "E_flux"]],
+            height=280
+        )
+    # Show the latest 'pressures' in a tiny table
+    latest = df.iloc[[-1]][["Sense", "Motor", "Internal", "E_cell", "E_env", "E_flux"]].copy() if not df.empty else pd.DataFrame()
+    table_box.dataframe(latest, use_container_width=True)
+
+def append_log(msg: str):
+    prev = st.session_state.get("log_txt", "")
+    new = (prev + msg + "\n")[-8000:]
+    st.session_state["log_txt"] = new
+    log_area.code(new, language="text")
+
+# ----- Run button action ------------------------------------------------------
 if run_btn:
-    st.success("Starting…")
+    # Create engine fresh each time you click Run
     engine = make_engine(cfg)
 
-    # layout
-    col1, col2 = st.columns([1, 1])
-    energy_chart = col1.line_chart({"energy": [engine.energy[0]]})
-    env_fig = col2.empty()
-    subs_fig = col1.empty()
-    act_fig = col2.empty()
-    prog = st.progress(0, text="Running…")
+    # Tell user what’s happening
+    status.info("Starting simulation …")
 
-    def redraw(t_now: int):
-        if not live_mode:
-            return
-        T = t_now + 1
-        # energy
-        energy_chart.add_rows({"energy": engine.energy[:T]})
+    try:
+        if live_mode:
+            # mutable holder (no `nonlocal`)
+            last = [0]
+            chunk = max(1, int(cfg["chunk"]))
 
-        # env heatmap
-        fig1, ax1 = plt.subplots(figsize=(6, 3))
-        im1 = ax1.imshow(engine.env[:T].T, aspect="auto", origin="lower")
-        ax1.set_title("Environment")
-        ax1.set_xlabel("frame"); ax1.set_ylabel("space")
-        plt.colorbar(im1, ax=ax1, fraction=0.046, pad=0.04)
-        env_fig.pyplot(fig1); plt.close(fig1)
+            def cb(t: int):
+                # stream updates in chunks (or on the final tick)
+                if t - last[0] >= chunk or t == cfg["frames"] - 1:
+                    last[0] = t
+                    append_log(f"tick {t}")
+                    redraw(engine, t)
 
-        # substrate heatmap
-        fig2, ax2 = plt.subplots(figsize=(6, 3))
-        im2 = ax2.imshow(engine.subs[:T].T, aspect="auto", origin="lower", cmap="magma")
-        ax2.set_title("Substrate")
-        ax2.set_xlabel("frame"); ax2.set_ylabel("space")
-        plt.colorbar(im2, ax=ax2, fraction=0.046, pad=0.04)
-        subs_fig.pyplot(fig2); plt.close(fig2)
+            engine.run(progress_cb=cb)
+            redraw(engine, cfg["frames"] - 1)
+        else:
+            engine.run(progress_cb=None)
+            redraw(engine, cfg["frames"] - 1)
 
-        # activations (connections × time)
-        fig3, ax3 = plt.subplots(figsize=(6, 3))
-        im3 = ax3.imshow(engine.act[:T].T, aspect="auto", origin="lower", cmap="viridis")
-        ax3.set_title("Connection activations")
-        ax3.set_xlabel("frame"); ax3.set_ylabel("connection idx")
-        plt.colorbar(im3, ax=ax3, fraction=0.046, pad=0.04)
-        act_fig.pyplot(fig3); plt.close(fig3)
+        status.success("Done!")
+    except Exception as e:
+        status.error("Simulation failed.")
+        st.exception(e)
 
-        prog.progress(min(1.0, T / cfg["frames"]), text=f"Running… {T}/{cfg['frames']}")
-
-    # run with streaming
-    if live_mode:
-        last = [0]
-        def cb(t):
-            nonlocal last[0]
-            if t - last[0] >= chunk or t == cfg["frames"] - 1:
-                last[0] = t
-                redraw(t)
-        engine.run(progress_cb=cb)
-        redraw(cfg["frames"] - 1)
-    else:
-        engine.run(progress_cb=None)
-        redraw(cfg["frames"] - 1)
-
-    st.success("Done!")
+st.caption("Tip: turn on **Live streaming** and optionally set a small per‑tick delay (1–5 ms) to watch it evolve.")
