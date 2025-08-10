@@ -6,6 +6,8 @@ import pandas as pd
 import streamlit as st
 
 from sim_core import default_config, make_engine
+# top of app.py
+from sim_core import default_config, Engine
 
 st.set_page_config(page_title="Fuka: Free‑Energy Simulation", layout="wide")
 
@@ -13,7 +15,9 @@ st.set_page_config(page_title="Fuka: Free‑Energy Simulation", layout="wide")
 if "cfg" not in st.session_state:
     st.session_state.cfg = default_config()
 if "engine" not in st.session_state:
-    st.session_state.engine = None   # created on Play/Reset
+    # where we create the engine
+    st.session_state.engine = Engine(cfg)
+    # st.session_state.engine = None   # created on Play/Reset
 if "running" not in st.session_state:
     st.session_state.running = False
 
