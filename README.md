@@ -1,5 +1,5 @@
 # Fuka
-First Universal Common Ancestor (FUKA)
+First Universal Kommon Ancestor (FUKA)
 (k is the first mutation)
 
 ~ යසස්~
