@@ -149,11 +149,11 @@ if run_btn:
 
     # run with streaming
     if live_mode:
-        last = 0
+        last = [0]
         def cb(t):
-            nonlocal last
-            if t - last >= chunk or t == cfg["frames"] - 1:
-                last = t
+            nonlocal last[0]
+            if t - last[0] >= chunk or t == cfg["frames"] - 1:
+                last[0] = t
                 redraw(t)
         engine.run(progress_cb=cb)
         redraw(cfg["frames"] - 1)
