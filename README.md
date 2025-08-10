@@ -3,5 +3,6 @@ First Universal Kommon Ancestor (FUKA)
 
 (k is the first mutation)
 
-~ යසස්~
+~යසස්~
+
 (10-ජූලි-2025)
