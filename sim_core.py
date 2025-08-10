@@ -1,158 +1,243 @@
 # sim_core.py
-# Minimal simulation core + simple “engine” to be driven by Streamlit.
-# Focus here is correctness & clean API (make_engine / Engine.run / Engine.curves).
+# FUKA — minimal live engine with editable space‑time signal and logging
+# No trig; only softplus, linear moves, and Gaussian/RBF kernels.
 
 from __future__ import annotations
-
-import math
-import time
-from dataclasses import dataclass
-from typing import Callable, Dict, Optional
-
+from dataclasses import dataclass, asdict
 import numpy as np
-import pandas as pd
+from typing import Dict, Any, Optional
 
+# ---------- small numerics ----------
+def softplus(x: np.ndarray | float) -> np.ndarray | float:
+    # stable softplus, avoids overflow in exp
+    x = np.asarray(x)
+    out = np.empty_like(x, dtype=float)
+    big = x > 20
+    small = x < -20
+    mid = (~big) & (~small)
+    out[big] = x[big]
+    out[small] = np.exp(x[small])
+    out[mid] = np.log1p(np.exp(x[mid]))
+    return out
 
-def default_config() -> Dict:
-    return {
-        "frames": 1600,     # total ticks
-        "space": 192,       # spatial DOF
-        "seed": 0,
-        "env_level": 1.0,   # environment free-energy scale
-        "motor_bias": 0.2,  # relative tendency toward “motor-like” action
-        "internal_bias": 0.2,
-        "sense_bias": 0.6,
-        "chunk": 25,        # streaming redraw interval
-        "sleep_ms": 0,      # artificial slowdown for streaming (0 = none)
-    }
+_rng = np.random.default_rng
 
-
+# ---------- Space‑Time field ----------
 @dataclass
+class FieldCfg:
+    space: int = 192
+    frames: int = 1600
+    seed: int = 0
+    # DoF for the signal (K moving Gaussian “events”)
+    K: int = 5
+    amp: float = 1.0
+    width_min: float = 6.0
+    width_max: float = 22.0
+    speed_min: float = 0.4
+    speed_max: float = 1.6
+    # where the boundary lives (0 .. space-1)
+    boundary_idx: int = 0
+    # global offset (lets you “move” energy away/towards boundary)
+    offset: int = 0
+    # shape preset: "gauss", "ridge", "blob"
+    preset: str = "gauss"
+
+class SpaceTimeField:
+    """
+    Editable space‑time signal with K DoF (centers, widths, velocities, weights).
+    All motion is linear-in-time; kernels are Gaussian (no trig).
+    """
+    def __init__(self, cfg: FieldCfg):
+        self.cfg = cfg
+        self.rng = _rng(cfg.seed)
+        S, T = cfg.space, cfg.frames
+
+        K = cfg.K
+        self.c = self.rng.uniform(0, S-1, size=K)         # centers
+        self.v = self.rng.uniform(cfg.speed_min, cfg.speed_max, size=K) * self.rng.choice([-1,1], size=K)
+        self.w = self.rng.uniform(0.6, 1.4, size=K) * cfg.amp
+        self.s = self.rng.uniform(cfg.width_min, cfg.width_max, size=K)  # std (space)
+        if cfg.preset == "ridge":
+            # longer narrow structures
+            self.s *= 0.6
+            self.w *= 1.2
+        elif cfg.preset == "blob":
+            self.s *= 1.6
+            self.w *= 0.8
+
+        # buffers (filled on demand)
+        self.last_t = -1
+        self.last_slice: Optional[np.ndarray] = None
+
+    def slice(self, t: int) -> np.ndarray:
+        """Return S-length signal at frame t."""
+        if t == self.last_t and self.last_slice is not None:
+            return self.last_slice
+        S = self.cfg.space
+        x = (np.arange(S) + self.cfg.offset) % S
+
+        # linear motion (reflect at edges)
+        ct = self.c + self.v * t
+        # reflect with “bounce”
+        m = 2*(S-1)
+        ct = np.abs((ct % m) - (S-1))
+
+        signal = np.zeros(S, dtype=float)
+        for ci, si, wi in zip(ct, self.s, self.w):
+            d = x - ci
+            g = np.exp(-(d*d)/(2.0*si*si))
+            signal += wi * g
+        self.last_t = t
+        self.last_slice = signal
+        return signal
+
+    def perturb(self, scale: float = 1.2):
+        """Multiply weights by scale (quick ‘free energy up’)."""
+        self.w *= float(scale)
+        # invalidate cache
+        self.last_t = -1
+        self.last_slice = None
+
+    def as_params(self) -> Dict[str, Any]:
+        return dict(c=self.c.tolist(), v=self.v.tolist(), w=self.w.tolist(), s=self.s.tolist())
+
+# ---------- Engine / roles ----------
+@dataclass
+class Config:
+    # environment + run
+    field: FieldCfg = FieldCfg()
+    frames: int = 1600
+    seed: int = 0
+    redraw_every: int = 20
+
+    # “roles” strengths (emergent; we just log the energies they harvest)
+    sense_bias: float = 0.3
+    motor_bias: float = 0.3
+    internal_bias: float = 0.4
+
+    # costs
+    act_cost: float = 0.01
+    leak: float = 0.001
+
+def default_config() -> Dict[str, Any]:
+    return asdict(Config())
+
 class Engine:
-    cfg: Dict
-    rng: np.random.Generator
-    t: int
-    curves: Dict[str, np.ndarray]
-    info: Dict
+    """
+    Very small ‘cell’ that tries to keep a free‑energy gradient vs environment.
+    We track three emergent channels: SENSE, MOTOR, INTERNAL (not hard-coded as types,
+    only as energy collection mechanisms). No trig; all local, linear, or softplus.
+    """
+    def __init__(self, cfg: Dict[str, Any]):
+        # unpack
+        self.cfg = cfg
+        self.frames = int(cfg.get("frames", 1600))
+        self.rng = _rng(int(cfg.get("seed", 0)))
 
-    def __init__(self, cfg: Dict):
-        self.cfg = dict(cfg)
-        self.rng = np.random.default_rng(int(self.cfg.get("seed", 0)))
-        T = int(self.cfg.get("frames", 1000))
-        N = int(self.cfg.get("space", 128))
+        # field
+        fcfg = cfg.get("field", {})
+        if isinstance(fcfg, dict):
+            fcfg = FieldCfg(**fcfg)
+        self.field = SpaceTimeField(fcfg)
 
-        # Curves we’ll expose to the UI
-        self.curves = {
-            "E_env": np.zeros(T, dtype=float),     # environment free energy
-            "E_cell": np.zeros(T, dtype=float),    # internal/pool energy
-            "E_flux": np.zeros(T, dtype=float),    # net flux into the cell
-            "Sense": np.zeros(T, dtype=float),
-            "Motor": np.zeros(T, dtype=float),
-            "Internal": np.zeros(T, dtype=float),
+        # state
+        self.E_cell = 1.0     # internal energy pool
+        self.history: Dict[str, list] = {
+            "E_cell": [], "E_env": [], "E_flux": [],
+            "SENSE": [], "MOTOR": [], "INTERNAL": [],
         }
-        self.info = {"space": N, "frames": T}
-        self.t = 0
+        # persistent “model” of signal (RBF bank learned online)
+        self.M_centers = np.linspace(0, fcfg.space-1, 16)
+        self.M_width = 12.0
+        self.M_weights = np.zeros_like(self.M_centers)
 
-        # Internal “state”
-        self._E = float(self.cfg.get("env_level", 1.0))  # environment level
-        self._Cell = 0.1                                 # internal energy pool
-        self._s = 0.0                                    # “sensor pressure”
-        self._m = 0.0                                    # “motor pressure”
-        self._i = 0.0                                    # “internal pressure”
+    # --- helper: cheap RBF projection, no trig
+    def _rbf(self, x: np.ndarray, centers: np.ndarray, width: float) -> np.ndarray:
+        # returns [len(x), len(centers)] activations
+        d = x[:, None] - centers[None, :]
+        return np.exp(-(d*d) / (2.0*width*width))
 
-        # Pre-build a smooth environment signal (no trig; smoothed noise)
-        # start at env_level and wander via clipped random walk
-        drift = self.rng.normal(0.0, 0.05, size=T)
-        env = np.empty(T, dtype=float)
-        level = float(self.cfg.get("env_level", 1.0))
-        for k in range(T):
-            level = level + 0.25 * drift[k]
-            # squash into a positive band ~[0, 2] using softplus-like mapping
-            # softplus(x) ~ log(1 + exp(x)); here we just clamp to keep finite
-            level = float(np.clip(level, -3.0, 3.0))
-            env[k] = math.log1p(math.exp(level))  # always > 0, smooth
-        # normalize so mean ≈ env_level
-        scale = float(self.cfg.get("env_level", 1.0)) / (env.mean() + 1e-9)
-        env *= scale
-        self._env_traj = env
+    def _update_model(self, env_slice: np.ndarray):
+        # one‑step Hebbian-ish update
+        x = np.arange(env_slice.size)
+        Phi = self._rbf(x, self.M_centers, self.M_width)  # [S, M]
+        y = env_slice
+        # local update
+        grad = Phi.T @ y / (y.size + 1e-9)
+        self.M_weights = 0.98*self.M_weights + 0.02*grad
 
-    def _step_dynamics(self, t: int):
-        """
-        One tick of very simple, numerically-stable dynamics.
-        We model:
-          - E_env[t] from a smoothed random walk (precomputed)
-          - Flux into cell depends on Motor (exploit/env-explore) + Sense (efficient capture)
-          - Internal acts like catalytic structuring that increases efficiency over time
-        All terms are small and bounded to avoid overflow.
-        """
-        # Read environment at t
-        E_env = float(self._env_traj[t])
+    def _predict(self) -> np.ndarray:
+        x = np.arange(self.field.cfg.space)
+        Phi = self._rbf(x, self.M_centers, self.M_width)
+        return Phi @ self.M_weights
 
-        # small random nudges to “pressures”
-        self._m += 0.02 * (self.cfg["motor_bias"] - self._m) + 0.01 * self.rng.normal()
-        self._s += 0.02 * (self.cfg["sense_bias"] - self._s) + 0.01 * self.rng.normal()
-        self._i += 0.02 * (self.cfg["internal_bias"] - self._i) + 0.01 * self.rng.normal()
+    # --- single step ---
+    def step(self, t: int):
+        s_t = self.field.slice(t)                 # environment at boundary+interior
+        env_energy = float(np.mean(s_t))          # scalar proxy
 
-        # keep them bounded
-        self._m = float(np.clip(self._m, 0.0, 1.0))
-        self._s = float(np.clip(self._s, 0.0, 1.0))
-        self._i = float(np.clip(self._i, 0.0, 1.0))
+        # SENSE harvest: correlation gain when our model matches env
+        pred = self._predict()
+        match = 1.0 - np.mean(np.abs(s_t - pred)) / (np.mean(np.abs(s_t)) + 1e-9)
+        sense_gain = self.cfg["sense_bias"] * softplus(3.0*match) * 0.2
 
-        # Efficiency rises with structure (internal) and sensing
-        eff = 0.15 + 0.5 * self._s + 0.35 * self._i
-        eff = float(np.clip(eff, 0.05, 0.98))
+        # MOTOR harvest: push/pull relative to boundary gradient
+        b = self.field.cfg.boundary_idx
+        bwin = s_t[max(0, b-2):min(s_t.size, b+3)]
+        grad = float(np.max(bwin) - np.min(bwin))
+        # small explore term (random “pokes”)
+        explore = self.rng.normal(0, 0.03)
+        motor_gain = self.cfg["motor_bias"] * softplus(grad + explore) * 0.15
 
-        # “Reach” rises with motor pressure but has diminishing returns
-        reach = 0.1 + 0.8 * (1.0 - math.exp(-2.0 * self._m))
-        reach = float(np.clip(reach, 0.05, 0.95))
+        # INTERNAL harvest: maintain temporal slope (cheap memory)
+        if len(self.history["E_env"]) == 0:
+            slope = 0.0
+        else:
+            slope = env_energy - self.history["E_env"][-1]
+        internal_gain = self.cfg["internal_bias"] * softplus(0.8*abs(slope)) * 0.08
 
-        # Flux is product of available env, reach, and efficiency
-        flux = E_env * reach * eff
+        # costs
+        activity = sense_gain + motor_gain + internal_gain
+        cost = self.cfg["act_cost"] * activity + self.cfg["leak"] * self.E_cell
 
-        # Internal maintenance + mild leakage
-        maintenance = 0.02 + 0.02 * (self._Cell)
-        leak = 0.015 * self._Cell
+        # update energy pool
+        E_flux = (sense_gain + motor_gain + internal_gain) - cost
+        self.E_cell = max(0.0, self.E_cell + E_flux)
 
-        # Update cell energy (never below 0)
-        dE = flux - (maintenance + leak)
-        self._Cell = float(max(0.0, self._Cell + dE))
+        # update world model after “sensing”
+        self._update_model(s_t)
 
-        # Save curves
-        self.curves["E_env"][t] = E_env
-        self.curves["E_cell"][t] = self._Cell
-        self.curves["E_flux"][t] = dE
-        self.curves["Sense"][t] = self._s
-        self.curves["Motor"][t] = self._m
-        self.curves["Internal"][t] = self._i
+        # log
+        self.history["E_cell"].append(self.E_cell)
+        self.history["E_env"].append(env_energy)
+        self.history["E_flux"].append(E_flux)
+        self.history["SENSE"].append(sense_gain)
+        self.history["MOTOR"].append(motor_gain)
+        self.history["INTERNAL"].append(internal_gain)
 
-    def run(self, progress_cb: Optional[Callable[[int], None]] = None):
-        T = self.info["frames"]
-        sleep_ms = int(self.cfg.get("sleep_ms", 0))
-        for t in range(T):
-            self._step_dynamics(t)
-            self.t = t
+    # --- public API ---
+    def run(self, progress_cb=None):
+        for t in range(self.frames):
+            self.step(t)
             if progress_cb is not None:
                 progress_cb(t)
-            if sleep_ms > 0:
-                time.sleep(sleep_ms / 1000.0)
 
-    # convenience for UI
-    def curves_frame(self, upto: Optional[int] = None) -> pd.DataFrame:
-        if upto is None:
-            upto = self.t
-        upto = max(0, min(int(upto), self.info["frames"] - 1))
-        data = {
-            "tick": np.arange(upto + 1),
-            "E_env": self.curves["E_env"][:upto + 1],
-            "E_cell": self.curves["E_cell"][:upto + 1],
-            "E_flux": self.curves["E_flux"][:upto + 1],
-            "Sense": self.curves["Sense"][:upto + 1],
-            "Motor": self.curves["Motor"][:upto + 1],
-            "Internal": self.curves["Internal"][:upto + 1],
-        }
-        return pd.DataFrame(data)
+    def get_series(self) -> Dict[str, np.ndarray]:
+        return {k: np.array(v, dtype=float) for k, v in self.history.items()}
 
+    def get_env_frame(self, t: int) -> np.ndarray:
+        t = int(np.clip(t, 0, self.frames-1))
+        return self.field.slice(t)
 
-def make_engine(cfg: Dict) -> Engine:
-    """Factory kept separate so the app can import it reliably."""
-    return Engine(cfg)
+    def perturb_env(self, scale: float = 1.2):
+        self.field.perturb(scale)
+
+    def snapshot(self) -> Dict[str, Any]:
+        out = dict(cfg=self.cfg, field_params=self.field.as_params(), history=self.get_series())
+        return out
+
+# convenience for the UI
+def run_sim(cfg: Dict[str, Any], cb=None) -> Dict[str, np.ndarray]:
+    eng = Engine(cfg)
+    eng.run(progress_cb=cb)
+    return eng.get_series()
