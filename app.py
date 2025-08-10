@@ -1,142 +1,146 @@
 # app.py
+# Streamlit front‑end for the Fuka free‑energy simulation
+
+from __future__ import annotations
 import time
-from typing import Optional
 import numpy as np
 import pandas as pd
 import streamlit as st
 
-# from sim_core import default_config, make_engine
-# top of app.py
-from sim_core import default_config, Engine
+from sim_core import default_config, make_engine
 
 st.set_page_config(page_title="Fuka: Free‑Energy Simulation", layout="wide")
 
-# ---------------- Session state ----------------
-if "cfg" not in st.session_state:
-    st.session_state.cfg = default_config()
+# ---------- helpers ----------
+def clamp(x, lo, hi):
+    return max(lo, min(hi, x))
+
+def get_cfg_from_sidebar():
+    cfg = dict(default_config)
+
+    with st.sidebar:
+        st.header("Simulation controls")
+
+        # Core sizes and runtime
+        frames_min, frames_max, frames_step = 200, 20000, 200
+        space_min, space_max = 64, 512
+
+        cfg["frames"] = st.number_input(
+            "Max frames to keep (history buffer)",
+            min_value=frames_min, max_value=frames_max,
+            value=cfg["frames"], step=frames_step
+        )
+        cfg["space"] = st.number_input(
+            "Space size (spatial cells)",
+            min_value=space_min, max_value=space_max,
+            value=cfg["space"], step=16
+        )
+        cfg["seed"] = int(st.number_input("Seed", 0, 10_000, cfg["seed"], 1))
+
+        st.markdown("---")
+        st.subheader("Environment energy")
+        cfg["env.energy"] = st.slider("Free energy (total scale)", 0.0, 10.0, cfg["env.energy"], 0.1)
+        cfg["env.boundary_bias"] = st.slider("Boundary bias (0=deep, 1=boundary)", 0.0, 1.0, cfg["env.boundary_bias"], 0.01)
+        cfg["env.num_tracks"] = int(st.number_input("Moving energy tracks", 1, 12, cfg["env.num_tracks"], 1))
+        cfg["env.noise"] = st.slider("Background noise", 0.0, 0.5, cfg["env.noise"], 0.01)
+
+        st.markdown("---")
+        st.subheader("Substrate")
+        cfg["subs.decay"] = st.slider("Substrate decay", 0.80, 0.999, cfg["subs.decay"], 0.001)
+        cfg["subs.couple_env"] = st.slider("Env→substrate coupling", 0.0, 1.0, cfg["subs.couple_env"], 0.01)
+        cfg["subs.couple_conn"] = st.slider("Conn→substrate coupling", 0.0, 1.0, cfg["subs.couple_conn"], 0.01)
+
+        st.markdown("---")
+        st.subheader("Connections")
+        cfg["conn.init_count"] = int(st.number_input("Initial connections", 0, 64, cfg["conn.init_count"], 1))
+        cfg["conn.grow_every"] = int(st.number_input("Grow attempt every N frames", 1, 500, cfg["conn.grow_every"], 1))
+        cfg["conn.max"] = int(st.number_input("Max connections", 0, 256, cfg["conn.max"], 1))
+
+        st.markdown("---")
+        st.subheader("Economy")
+        cfg["econ.cost.activation"] = st.slider("Activation cost", 0.0, 0.1, cfg["econ.cost.activation"], 0.001)
+        cfg["econ.cost.maintenance"] = st.slider("Maintenance cost", 0.0, 0.05, cfg["econ.cost.maintenance"], 0.001)
+        cfg["econ.harvest.direct"] = st.slider("Direct harvest factor", 0.0, 1.0, cfg["econ.harvest.direct"], 0.01)
+        cfg["econ.harvest.indirect"] = st.slider("Indirect (model) harvest", 0.0, 1.0, cfg["econ.harvest.indirect"], 0.01)
+        cfg["econ.harvest.motor"] = st.slider("Motor harvest factor", 0.0, 1.0, cfg["econ.harvest.motor"], 0.01)
+
+        st.markdown("---")
+        st.subheader("Run settings")
+        cfg["ui.steps_per_tick"] = int(st.number_input("Steps per tick", 1, 200, cfg["ui.steps_per_tick"], 1))
+        cfg["ui.refresh_ms"] = int(st.number_input("Refresh (ms)", 100, 3000, cfg["ui.refresh_ms"], 50))
+
+        st.caption("Tip: Stop → tweak sliders → Start to apply changes.")
+
+    return cfg
+
+# ---------- session engine ----------
 if "engine" not in st.session_state:
-    # where we create the engine
-    st.session_state.engine = Engine(cfg)
-    # st.session_state.engine = None   # created on Play/Reset
+    st.session_state.engine = None
 if "running" not in st.session_state:
     st.session_state.running = False
 
-cfg = st.session_state.cfg
+# Build or rebuild engine
+cfg = get_cfg_from_sidebar()
 
-# ---------------- Sidebar controls ----------------
-with st.sidebar:
-    st.title("Controls")
-
-    # Core
-    cfg["space"] = st.number_input("Space (grid size)", 32, 1024, int(cfg.get("space", 192)), 32)
-    cfg["seed"]  = st.number_input("Random seed", 0, 10_000_000, int(cfg.get("seed", 0)), 1)
-
-    st.subheader("Environment")
-    cfg["env_energy"] = st.slider("Boundary free energy", 0.0, 10.0, float(cfg.get("env_energy", 1.0)), 0.1)
-    cfg["env_persistence"] = st.slider("Environment persistence", 0.0, 0.999, float(cfg.get("env_persistence", 0.95)), 0.01)
-    cfg["env_variability"] = st.slider("Environment variability", 0.0, 1.0, float(cfg.get("env_variability", 0.15)), 0.01)
-
-    st.subheader("Growth")
-    cfg["grow_every"]    = st.number_input("Grow Every (frames)", 10, 2000, int(cfg.get("grow_every", 40)), 10)
-    cfg["grow_attempts"] = st.number_input("Grow Attempts per event", 1, 64, int(cfg.get("grow_attempts", 3)), 1)
-
-    st.subheader("Loop")
-    cfg["step_chunk"] = st.number_input("Frames per tick", 1, 200, int(cfg.get("step_chunk", 5)), 1)
-    tick_ms = st.number_input("Update every (ms)", 50, 2000, 200, 10)
-
-    # Buttons
-    colA, colB, colC = st.columns(3)
-    with colA:
-        if st.button("▶ Play", use_container_width=True):
+col_l, col_r = st.columns([1, 1])
+with col_l:
+    if st.button("Initialize / Reset", use_container_width=True):
+        st.session_state.engine = make_engine(cfg)
+        st.session_state.running = False
+with col_r:
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        if st.button("Start", use_container_width=True, type="primary"):
             if st.session_state.engine is None:
                 st.session_state.engine = make_engine(cfg)
-            # update engine cfg on the fly
-            st.session_state.engine.cfg.update(cfg)
             st.session_state.running = True
-    with colB:
-        if st.button("⏸ Pause", use_container_width=True):
+    with c2:
+        if st.button("Stop", use_container_width=True):
             st.session_state.running = False
-    with colC:
-        if st.button("⟲ Reset", use_container_width=True):
-            st.session_state.engine = make_engine(cfg)
-            st.session_state.running = False
+    with c3:
+        if st.button("Step once", use_container_width=True):
+            if st.session_state.engine is None:
+                st.session_state.engine = make_engine(cfg)
+            st.session_state.engine.step(cfg["ui.steps_per_tick"])
 
-    if st.button("Step once", use_container_width=True):
-        if st.session_state.engine is None:
-            st.session_state.engine = make_engine(cfg)
-        st.session_state.engine.cfg.update(cfg)
-        st.session_state.engine.step(int(cfg["step_chunk"]))
-        st.experimental_rerun()
+if st.session_state.running:
+    # auto-refresh loop while running
+    st_autorefresh = st.experimental_rerun  # compatibility alias
+    st.session_state.engine.step(cfg["ui.steps_per_tick"])
+    # schedule next UI tick
+    st.experimental_singleton.clear()  # no-op guard for older runtimes
+    st_autorefresh()
 
+# ---------- plots ----------
 st.title("Fuka: Free‑Energy Simulation")
 
-# ---------------- Placeholders ----------------
-ph_energy = st.empty()
-col1, col2 = st.columns([1.2, 1.0], gap="large")
-with col1:
-    ph_env = st.empty()
-with col2:
-    ph_table = st.empty()
-ph_log = st.expander("Event Log (head)", expanded=False)
-ph_drive = st.expander("Drive Trace (head)", expanded=False)
+eng = st.session_state.engine
+if eng is None:
+    st.info("Click **Initialize / Reset** to create the engine, then **Start**.")
+    st.stop()
 
-def render(engine) -> None:
-    snap = engine.snapshot()
+state = eng.get_state()
 
-    # Energy chart
-    if snap["energy_series"]:
-        dfE = pd.DataFrame({
-            "frame": np.arange(len(snap["energy_series"])),
-            "energy": np.array(snap["energy_series"], dtype=float)
-        })
-        ph_energy.subheader("Global Energy (recent)"); ph_energy.line_chart(dfE.set_index("frame"))
+# 1) Energy curve
+e_df = pd.DataFrame({"energy": state["energy_hist"]})
+st.subheader("Global Energy")
+st.line_chart(e_df, height=180)
 
-    # Environment / substrate heat (env only here, substrate shown via last row intensity)
-    with col1:
-        if snap["env"] is not None and snap["env"].size:
-            ph_env.subheader("Environment (recent window)")
-            ph_env.pyplot(_imshow(snap["env"]))
+# 2) Environment field (history)
+st.subheader("Environment events (direct field)")
+st.caption("Heatmap over time (x‑axis) and space (y‑axis).")
+st.pyplot(eng.plot_env_history(), clear_figure=True, use_container_width=True)
 
-    # Connections table
-    dfC = pd.DataFrame(snap["conn_table"])
-    with col2:
-        ph_table.subheader("Connections (summary)")
-        ph_table.dataframe(dfC, use_container_width=True, height=400)
+# 3) Substrate history
+st.subheader("Substrate state S")
+st.pyplot(eng.plot_subs_history(), clear_figure=True, use_container_width=True)
 
-    with ph_log:
-        if snap["event_log_head"]:
-            dfL = pd.DataFrame(snap["event_log_head"], columns=["when", "event", "payload"])
-            st.dataframe(dfL, use_container_width=True, height=220)
+# 4) Connections activation history
+st.subheader("Connections (rows) — activation proxy")
+st.pyplot(eng.plot_conn_history(), clear_figure=True, use_container_width=True)
 
-    with ph_drive:
-        if snap["drive_trace_head"]:
-            dfD = pd.DataFrame(snap["drive_trace_head"])
-            st.dataframe(dfD, use_container_width=True, height=220)
+# 5) Emergent roles
+st.subheader("Emergent roles (by dominant harvest)")
+st.bar_chart(pd.Series(state["role_counts"]), height=240)
 
-def _imshow(arr2d):
-    # Tiny helper to plot a heatmap with matplotlib on demand
-    import matplotlib.pyplot as plt
-    fig, ax = plt.subplots(figsize=(6, 3))
-    im = ax.imshow(arr2d, aspect="auto", origin="lower")
-    ax.set_xlabel("recent frames")
-    ax.set_ylabel("space")
-    fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-    plt.tight_layout()
-    return fig
-
-# ---------------- Run loop ----------------
-engine = st.session_state.engine
-if engine is not None:
-    render(engine)
-
-# When playing, advance in small chunks and redraw.
-# NOTE: Streamlit executes top->bottom each run, so we trigger another rerun.
-if st.session_state.running:
-    engine.cfg.update(cfg)               # live-apply changed sliders
-    engine.step(int(cfg["step_chunk"]))  # advance
-    render(engine)
-    # gentle pacing
-    time.sleep(int(tick_ms)/1000.0)
-    st.experimental_rerun()
-else:
-    st.info("Press **Play** to start continuous simulation. Use sliders while it runs.")
+st.success("Done!" if not st.session_state.running else "Running…")
