@@ -29,7 +29,7 @@ def clamp(v, lo, hi): return int(max(lo, min(hi, v)))
 
 # basic knobs
 cfg["seed"]   = st.sidebar.number_input("Seed", 0, 1_000_000, int(cfg.get("seed", 0)), 1)
-cfg["frames"] = clamp(st.sidebar.number_input("Frames", 10000, 20000, int(cfg.get("frames", 1600)), 100), 200, 20000)
+cfg["frames"] = clamp(st.sidebar.number_input("Frames", 10000, 20000, int(cfg.get("frames", 1600)), 100), 200, 5000)
 cfg["space"]  = clamp(st.sidebar.number_input("Space (cells)", 32, 512, int(cfg.get("space", 192)), 16), 32, 512)
 
 # dynamics
