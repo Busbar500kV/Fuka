@@ -1,5 +1,9 @@
-# app.py — Streamlit dashboard (live)
+# app.py — Live Streamlit dashboard for the sliding-gate model (Model A)
+
 import json
+import io
+from typing import Dict, Tuple
+
 import numpy as np
 import matplotlib.pyplot as plt
 import streamlit as st
@@ -7,163 +11,140 @@ import streamlit as st
 from sim_core import make_engine, default_config, Engine
 
 st.set_page_config(page_title="Fuka – Free‑Energy Gradient Simulation (Live)", layout="wide")
-
-# --------------------------
-# Sidebar controls
-# --------------------------
-st.sidebar.title("Controls")
-
-# Keep a dict in session_state so reruns preserve your settings
-if "cfg" not in st.session_state:
-    st.session_state.cfg = default_config()
-cfg = st.session_state.cfg
-
-seed    = st.sidebar.number_input("Seed", 0, 10_000, int(cfg["seed"]), step=1)
-frames  = st.sidebar.number_input("Frames", 100, 100_000, int(cfg["frames"]), step=100)
-space   = st.sidebar.number_input("Space (cells)", 8, 1_024, int(cfg["space"]), step=1)
-
-k_flux  = st.sidebar.number_input("k_flux (boundary flux)", 0.0, 10.0, float(cfg.get("k_flux", 0.08)), step=0.01, format="%.3f")
-k_motor = st.sidebar.number_input("k_motor (motor explore)", 0.0, 20.0, float(cfg.get("k_motor", 4.90)), step=0.10, format="%.2f")
-k_noise = st.sidebar.number_input("k_noise (band noise)", 0.0, 2.0, float(cfg.get("k_noise", 0.02)), step=0.01, format="%.2f")
-
-decay   = st.sidebar.number_input("decay", 0.0, 1.0, float(cfg.get("decay", 0.01)), step=0.005, format="%.3f")
-diffuse = st.sidebar.number_input("diffuse", 0.0, 2.0, float(cfg.get("diffuse", 0.15)), step=0.01, format="%.2f")
-band    = st.sidebar.number_input("band (boundary width)", 1, 32, int(cfg.get("band", 3)), step=1)
-
-c_motor = st.sidebar.number_input("c_motor (motor work cost)", 0.0, 1.0, float(cfg.get("c_motor", 0.02)), step=0.005, format="%.3f")
-
-# Environment section
-st.sidebar.subheader("Environment")
-env_len  = st.sidebar.number_input("Env length", 8, 4096, int(cfg["env"]["length"]), step=8)
-env_sig  = st.sidebar.number_input("Env noise σ", 0.0, 1.0, float(cfg["env"]["noise_sigma"]), step=0.01)
-
-st.sidebar.markdown("**Sources JSON (list)**")
-src_str = st.sidebar.text_area(
-    "Edit env sources",
-    value=json.dumps(cfg["env"]["sources"], indent=2),
-    height=220
-)
-sources_ok = True
-try:
-    src_list = json.loads(src_str)
-    assert isinstance(src_list, list)
-    st.sidebar.success("Sources OK")
-except Exception as e:
-    sources_ok = False
-    st.sidebar.error(f"Invalid JSON: {e}")
-    src_list = cfg["env"]["sources"]
-
-live_mode = st.sidebar.checkbox("Live streaming", value=True)
-chunk     = st.sidebar.slider("Refresh chunk (frames)", 10, 500, 120)
-
-# Update session cfg dict
-cfg.update(dict(
-    seed=seed, frames=frames, space=space,
-    k_flux=k_flux, k_motor=k_motor, k_noise=k_noise,
-    decay=decay, diffuse=diffuse, band=band, c_motor=c_motor,
-))
-cfg["env"].update(dict(length=env_len, frames=frames, noise_sigma=env_sig, sources=src_list))
-
-# --------------------------
-# Main layout
-# --------------------------
 st.title("Fuka – Free‑Energy Gradient Simulation (Live)")
-status = st.empty()
 
-# Live line chart for energies
-fig_energy, ax_energy = plt.subplots()
-line_cell, = ax_energy.plot([], [], label="E_cell")
-line_env,  = ax_energy.plot([], [], label="E_env")
-line_flux, = ax_energy.plot([], [], label="E_flux")
-ax_energy.set_title("Energies (live)")
-ax_energy.legend(loc="upper left")
-energy_ph = st.pyplot(fig_energy, clear_figure=False)
+# ---------- helpers ----------
+def clamp(v, lo, hi): return max(lo, min(hi, v))
 
-# Live heatmaps (environment and substrate)
-col1, col2 = st.columns(2)
-with col1:
-    fig_env, ax_env = plt.subplots()
-    env_im = ax_env.imshow(np.zeros((10, 10)), aspect="auto", origin="lower")
-    ax_env.set_title("Environment E(t,x)")
-    ax_env.set_xlabel("frame"); ax_env.set_ylabel("space")
-    env_ph = st.pyplot(fig_env, clear_figure=False)
+def draw_energy(history, placeholder):
+    t = np.array(history.t, dtype=float)
+    if len(t) == 0: 
+        placeholder.empty()
+        return
 
-with col2:
-    fig_sub, ax_sub = plt.subplots()
-    sub_im = ax_sub.imshow(np.zeros((10, 10)), aspect="auto", origin="lower")
-    ax_sub.set_title("Substrate S(t,x)")
-    ax_sub.set_xlabel("frame"); ax_sub.set_ylabel("space")
-    sub_ph = st.pyplot(fig_sub, clear_figure=False)
+    fig, ax = plt.subplots(figsize=(8,4))
+    ax.plot(t, history.E_cell, label="E_cell")
+    ax.plot(t, history.E_env,  label="E_env")
+    ax.plot(t, history.E_flux, label="E_flux")
+    ax.set_title("Energies (live)")
+    ax.set_xlabel("frame"); ax.set_ylabel("level")
+    ax.legend(loc="upper left")
+    fig.tight_layout()
+    placeholder.pyplot(fig, clear_figure=True)
+    plt.close(fig)
 
-# --------------------------
-# Run button
-# --------------------------
-if st.button("Run / Rerun"):
-    status.info("Starting…")
+def draw_heatmap(mat, title, placeholder, vmin=None, vmax=None):
+    fig, ax = plt.subplots(figsize=(8,4))
+    im = ax.imshow(mat.T, origin="lower", aspect="auto", interpolation="nearest",
+                   vmin=vmin, vmax=vmax)
+    ax.set_title(title)
+    ax.set_xlabel("frame"); ax.set_ylabel("space")
+    fig.colorbar(im, ax=ax)
+    fig.tight_layout()
+    placeholder.pyplot(fig, clear_figure=True)
+    plt.close(fig)
 
-    # Build a fresh engine
+def draw_kernel(w, placeholder):
+    fig, ax = plt.subplots(figsize=(4,2.2))
+    ax.bar(np.arange(len(w)), w)
+    ax.set_title("Gate kernel (sensing DoF)")
+    ax.set_xlabel("offset"); ax.set_ylabel("weight")
+    fig.tight_layout()
+    placeholder.pyplot(fig, clear_figure=True)
+    plt.close(fig)
+
+
+# ---------- sidebar controls ----------
+with st.sidebar:
+    st.header("Controls")
+
+    cfg: Dict = st.session_state.get("cfg", default_config())
+
+    # core sizes
+    cfg["seed"]   = int(st.number_input("Seed", 0, 10_000, int(cfg.get("seed", 0)), 1))
+    cfg["frames"] = int(st.number_input("Frames", 100, 50_000, int(cfg.get("frames", 5000)), 100))
+    cfg["space"]  = int(st.number_input("Space (cells)", 16, 512, int(cfg.get("space", 64)), 1))
+
+    # physics
+    cfg["k_flux"]      = float(st.number_input("k_flux (boundary flux)", 0.0, 5.0, float(cfg.get("k_flux", 0.08)), 0.01))
+    cfg["k_motor"]     = float(st.number_input("k_motor (motor explore)", 0.0, 10.0, float(cfg.get("k_motor", 0.40)), 0.01))
+    cfg["motor_noise"] = float(st.number_input("motor_noise", 0.0, 1.0, float(cfg.get("motor_noise", 0.02)), 0.01))
+    cfg["c_motor"]     = float(st.number_input("c_motor (motor work cost)", 0.0, 1.0, float(cfg.get("c_motor", 0.02)), 0.001))
+    cfg["decay"]       = float(st.number_input("decay", 0.0, 0.5, float(cfg.get("decay", 0.01)), 0.001))
+    cfg["diffuse"]     = float(st.number_input("diffuse", 0.0, 1.0, float(cfg.get("diffuse", 0.15)), 0.01))
+    cfg["band"]        = int(st.number_input("band (boundary width)", 1, 16, int(cfg.get("band", 3)), 1))
+
+    # kernel learning
+    cfg["gate_win"]    = int(st.number_input("gate_win (half width K)", 1, 32, int(cfg.get("gate_win", 8)), 1))
+    cfg["eta"]         = float(st.number_input("eta (kernel LR)", 0.0, 1.0, float(cfg.get("eta", 0.02)), 0.001))
+    cfg["ema_beta"]    = float(st.number_input("ema_beta (baseline EMA)", 0.0, 1.0, float(cfg.get("ema_beta", 0.10)), 0.01))
+    cfg["lam_l1"]      = float(st.number_input("lam_l1 (L1 shrink)", 0.0, 0.1, float(cfg.get("lam_l1", 0.001)), 0.001))
+    cfg["prune_thresh"]= float(st.number_input("prune_thresh", 0.0, 0.1, float(cfg.get("prune_thresh", 1e-3)), 0.001))
+
+    # env block
+    if "env" not in cfg: cfg["env"] = {}
+    cfg["env"]["length"]     = int(st.number_input("Env length", 32, 4096, int(cfg["env"].get("length", 512)), 1))
+    cfg["env"]["noise_sigma"]= float(st.number_input("Env noise σ", 0.0, 1.0, float(cfg["env"].get("noise_sigma", 0.01)), 0.01))
+    cfg["env"]["frames"]     = int(cfg["frames"])
+
+    st.caption("Sources JSON (list)")
+    src_default = cfg["env"].get("sources", [
+        {"kind":"moving_peak","amp":1.0,"speed":0.0,"width":4.0,"start":340}
+    ])
+    src_text = st.text_area("Edit env sources", json.dumps(src_default, indent=2), height=160)
+    ok = True
+    try:
+        cfg["env"]["sources"] = json.loads(src_text)
+        st.success("Sources OK")
+    except Exception as e:
+        ok = False
+        st.error(f"Invalid JSON: {e}")
+
+    st.session_state["cfg"] = cfg
+
+    live = st.checkbox("Live streaming", value=True)
+    chunk = int(st.slider("Refresh chunk (frames)", 10, 500, 100, 10))
+    st.markdown("---")
+    run_btn = st.button("Run / Rerun", use_container_width=True, disabled=not ok)
+
+# ---------- placeholders ----------
+msg_box  = st.empty()
+energies = st.empty()
+col1, col2 = st.columns(2, gap="large")
+env_ph   = col1.empty()
+subs_ph  = col2.empty()
+ker_ph   = st.empty()
+
+# ---------- run ----------
+if run_btn and ok:
+    msg_box.info("Starting…")
     engine: Engine = make_engine(cfg)
 
-    # Buffers for live plots
-    t_list, c_list, e_list, f_list = [], [], [], []
+    # static env heatmap (known ahead)
+    msg_box.info("Building environment…")
+    draw_heatmap(engine.env, "Environment E(t,x)", env_ph)
 
-    # To build heatmaps incrementally we pre-allocate
-    S_live = np.zeros((engine.T, engine.X), dtype=float)
-    # We’ll construct a resampled env heatmap on the fly
-    E_live = np.zeros((engine.T, engine.X), dtype=float)
+    # streaming loop
+    msg_box.info("Running…")
+    T = engine.T
+    last_draw = -1
+    vmax_s = None  # autoscale after a few frames
 
-    def redraw(t: int):
-        # Update lines
-        line_cell.set_data(t_list, c_list)
-        line_env.set_data(t_list, e_list)
-        line_flux.set_data(t_list, f_list)
-        ax_energy.relim(); ax_energy.autoscale_view()
-        energy_ph.pyplot(fig_energy, clear_figure=False)
+    for t in range(T):
+        engine.step(t)
 
-        # Update env heatmap (show all rows up to current t)
-        env_im.set_data(E_live[:t+1].T)
-        env_im.set_extent([0, t+1, 0, engine.X])  # frame axis grows
-        fig_env.tight_layout()
-        env_ph.pyplot(fig_env, clear_figure=False)
+        # draw periodically
+        if (t - last_draw) >= chunk or t == T-1:
+            last_draw = t
+            draw_energy(engine.hist, energies)
 
-        # Update substrate heatmap
-        sub_im.set_data(S_live[:t+1].T)
-        sub_im.set_extent([0, t+1, 0, engine.X])
-        fig_sub.tight_layout()
-        sub_ph.pyplot(fig_sub, clear_figure=False)
+            # substrates: only up to current t
+            S_part = engine.S[:t+1]
+            # fix color scale after some warm-up so it doesn't flicker
+            if vmax_s is None and t > max(20, chunk):
+                vmax_s = float(np.percentile(S_part, 99))
+            draw_heatmap(S_part, "Substrate S(t,x)", subs_ph, vmin=0.0, vmax=vmax_s)
 
-    if live_mode:
-        last = [-1]  # mutable closure storage
+            draw_kernel(engine.w, ker_ph)
 
-        def cb(t: int):
-            # pull last values recorded by the engine
-            t_list.append(t)
-            c_list.append(engine.hist.E_cell[-1])
-            e_list.append(engine.hist.E_env[-1])
-            f_list.append(engine.hist.E_flux[-1])
-
-            # fill the images
-            S_live[t] = engine.S[t]
-            # env slice resampled used inside engine.step; reconstruct it here too
-            # (call private helper is okay for app convenience)
-            E_live[t] = engine._env_row_resampled(t)  # noqa
-
-            # redraw every chunk or at end
-            if (t - last[0] >= chunk) or (t == engine.T - 1):
-                last[0] = t
-                redraw(t)
-
-        engine.run(progress_cb=cb)
-        status.success("Done!")
-    else:
-        engine.run(progress_cb=None)
-        # Fill buffers for a final render
-        t_list = engine.hist.t
-        c_list = engine.hist.E_cell
-        e_list = engine.hist.E_env
-        f_list = engine.hist.E_flux
-        S_live[:, :] = engine.S
-        for t in range(engine.T):
-            E_live[t] = engine._env_row_resampled(t)  # noqa
-        redraw(engine.T - 1)
-        status.success("Done!")
+    msg_box.success("Done!")
