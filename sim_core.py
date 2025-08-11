@@ -22,24 +22,22 @@ class FieldCfg:
     #  - "constant_patch":   {"kind": "...", "amp": 1.0, "center": 15, "width": 8}
     #  - "moving_peak":      {"kind": "...", "amp": 1.0, "speed": 0.10, "width": 4.0, "start": 24}
     sources: List[Dict] = field(default_factory=lambda: [
-        # Constant patch near the boundary to encourage motor pumping
         {"kind": "constant_patch", "amp": 1.0, "center": 15, "width": 10},
-        # You can add more sources here (moving peaks, etc.)
     ])
 
 
 @dataclass
 class Config:
     seed: int = 0
-    frames: int = 3000   # simulation frames
-    space: int = 64      # number of substrate cells (your "space")
+    frames: int = 3000
+    space: int = 64
     # Dynamics knobs
-    k_flux: float  = 0.08   # strength of env->cell pumping at the boundary band
-    k_motor: float = 0.40   # random exploration pushes along boundary band
-    k_noise: float = 0.02   # extra small local noise on the band (direct)
-    decay: float   = 0.01   # substrate decay
-    diffuse: float = 0.15   # substrate diffusion
-    band: int      = 3      # boundary width used for flux/motor/noise
+    k_flux: float  = 0.08
+    k_motor: float = 0.40
+    k_noise: float = 0.02
+    decay: float   = 0.01
+    diffuse: float = 0.15
+    band: int      = 3
     env: FieldCfg  = field(default_factory=FieldCfg)
 
 
@@ -88,13 +86,11 @@ def build_env(cfg: FieldCfg, rng: np.random.Generator) -> np.ndarray:
             E += amp
 
         else:
-            # Unknown kind — ignore to be safe
             continue
 
     if cfg.noise_sigma > 0:
         E += rng.normal(0.0, cfg.noise_sigma, size=E.shape)
 
-    # Keep non-negative "free energy"
     np.maximum(E, 0.0, out=E)
     return E
 
@@ -131,7 +127,6 @@ class Engine:
         row = self.env[min(t, self.env.shape[0]-1)]
         if self.env.shape[1] == self.X:
             return row
-        # cheap periodic resample by index mapping
         idx = (np.arange(self.X) * self.env.shape[1] // self.X) % self.env.shape[1]
         return row[idx]
 
@@ -150,16 +145,16 @@ class Engine:
         b = int(max(1, cfg.band))
         band_slice = slice(0, b)
 
-        # flux pump: pull env free-energy into substrate where env>S
+        # flux pump
         grad = np.maximum(e_row[band_slice] - S_decayed[band_slice], 0.0)
         pump = np.zeros_like(S_decayed)
         pump[band_slice] += cfg.k_flux * grad
 
-        # motor exploration: random positive pushes along band
+        # motor exploration
         mot = np.zeros_like(S_decayed)
         mot[band_slice] += cfg.k_motor * self.rng.random(b)
 
-        # tiny direct noise (helps symmetry breaking)
+        # tiny direct noise (symmetry breaking)
         noi = np.zeros_like(S_decayed)
         if cfg.k_noise > 0:
             noi[band_slice] += cfg.k_noise * (self.rng.random(b) - 0.5)
