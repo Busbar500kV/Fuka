@@ -233,13 +233,15 @@ class Engine:
         return E_cell, E_env, E_flux
 
     def run(self, progress_cb: Optional[Callable[[int], None]] = None,
-            snapshot_every: int = 100):
+            snapshot_every: Optional[int] = None,):
+        every = max(1, int(snapshot_every)) if snapshot_every else None
+        
         for t in range(self.T):
             self.step(t)
-            if (t % snapshot_every) == 0:
-                # store kernel snapshot
-                self.w_hist_times.append(t)
-                self.w_hist.append(self.w.copy())
+            # if (t % snapshot_every) == 0:
+            # store kernel snapshot
+            # self.w_hist_times.append(t)
+            # self.w_hist.append(self.w.copy())
             if progress_cb is not None:
                 progress_cb(t)
 
