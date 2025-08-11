@@ -1,243 +1,191 @@
 # sim_core.py
-# FUKA — minimal live engine with editable space‑time signal and logging
-# No trig; only softplus, linear moves, and Gaussian/RBF kernels.
+# Minimal, self-contained simulation core with a streaming-capable Engine.
 
 from __future__ import annotations
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
+from typing import List, Dict, Optional, Callable, Tuple
 import numpy as np
-from typing import Dict, Any, Optional
 
-# ---------- small numerics ----------
-def softplus(x: np.ndarray | float) -> np.ndarray | float:
-    # stable softplus, avoids overflow in exp
-    x = np.asarray(x)
-    out = np.empty_like(x, dtype=float)
-    big = x > 20
-    small = x < -20
-    mid = (~big) & (~small)
-    out[big] = x[big]
-    out[small] = np.exp(x[small])
-    out[mid] = np.log1p(np.exp(x[mid]))
-    return out
 
-_rng = np.random.default_rng
+# =========================
+# Config data classes
+# =========================
 
-# ---------- Space‑Time field ----------
 @dataclass
 class FieldCfg:
-    space: int = 192
+    """Environment field (space-time) configuration."""
+    length: int = 192
     frames: int = 1600
-    seed: int = 0
-    # DoF for the signal (K moving Gaussian “events”)
-    K: int = 5
-    amp: float = 1.0
-    width_min: float = 6.0
-    width_max: float = 22.0
-    speed_min: float = 0.4
-    speed_max: float = 1.6
-    # where the boundary lives (0 .. space-1)
-    boundary_idx: int = 0
-    # global offset (lets you “move” energy away/towards boundary)
-    offset: int = 0
-    # shape preset: "gauss", "ridge", "blob"
-    preset: str = "gauss"
+    noise_sigma: float = 0.01
+    # Each source: {"kind": "moving_peak", "amp": float, "speed": float, "width": float, "start": int}
+    sources: List[Dict] = field(default_factory=lambda: [
+        {"kind": "moving_peak", "amp": 1.0, "speed":  0.10, "width": 4.0, "start": 24},
+        {"kind": "moving_peak", "amp": 0.8, "speed": -0.07, "width": 6.0, "start": 144},
+    ])
 
-class SpaceTimeField:
-    """
-    Editable space‑time signal with K DoF (centers, widths, velocities, weights).
-    All motion is linear-in-time; kernels are Gaussian (no trig).
-    """
-    def __init__(self, cfg: FieldCfg):
-        self.cfg = cfg
-        self.rng = _rng(cfg.seed)
-        S, T = cfg.space, cfg.frames
 
-        K = cfg.K
-        self.c = self.rng.uniform(0, S-1, size=K)         # centers
-        self.v = self.rng.uniform(cfg.speed_min, cfg.speed_max, size=K) * self.rng.choice([-1,1], size=K)
-        self.w = self.rng.uniform(0.6, 1.4, size=K) * cfg.amp
-        self.s = self.rng.uniform(cfg.width_min, cfg.width_max, size=K)  # std (space)
-        if cfg.preset == "ridge":
-            # longer narrow structures
-            self.s *= 0.6
-            self.w *= 1.2
-        elif cfg.preset == "blob":
-            self.s *= 1.6
-            self.w *= 0.8
-
-        # buffers (filled on demand)
-        self.last_t = -1
-        self.last_slice: Optional[np.ndarray] = None
-
-    def slice(self, t: int) -> np.ndarray:
-        """Return S-length signal at frame t."""
-        if t == self.last_t and self.last_slice is not None:
-            return self.last_slice
-        S = self.cfg.space
-        x = (np.arange(S) + self.cfg.offset) % S
-
-        # linear motion (reflect at edges)
-        ct = self.c + self.v * t
-        # reflect with “bounce”
-        m = 2*(S-1)
-        ct = np.abs((ct % m) - (S-1))
-
-        signal = np.zeros(S, dtype=float)
-        for ci, si, wi in zip(ct, self.s, self.w):
-            d = x - ci
-            g = np.exp(-(d*d)/(2.0*si*si))
-            signal += wi * g
-        self.last_t = t
-        self.last_slice = signal
-        return signal
-
-    def perturb(self, scale: float = 1.2):
-        """Multiply weights by scale (quick ‘free energy up’)."""
-        self.w *= float(scale)
-        # invalidate cache
-        self.last_t = -1
-        self.last_slice = None
-
-    def as_params(self) -> Dict[str, Any]:
-        return dict(c=self.c.tolist(), v=self.v.tolist(), w=self.w.tolist(), s=self.s.tolist())
-
-# ---------- Engine / roles ----------
 @dataclass
 class Config:
-    # environment + run
-    field: FieldCfg = FieldCfg()
-    frames: int = 1600
     seed: int = 0
-    redraw_every: int = 20
+    frames: int = 1600
+    space: int = 192
+    n_init: int = 9  # initial generic connections (not used heavily but kept for parity)
+    # energy / dynamics knobs
+    k_flux: float = 0.05       # how strongly boundary pumps env→cell when gradient exists
+    k_motor: float = 0.02      # random motor exploration pump along boundary band
+    decay: float = 0.01        # substrate local decay
+    diffuse: float = 0.15      # substrate diffusion strength
+    env: FieldCfg = field(default_factory=FieldCfg)
 
-    # “roles” strengths (emergent; we just log the energies they harvest)
-    sense_bias: float = 0.3
-    motor_bias: float = 0.3
-    internal_bias: float = 0.4
 
-    # costs
-    act_cost: float = 0.01
-    leak: float = 0.001
+# =========================
+# Helper: environment field
+# =========================
 
-def default_config() -> Dict[str, Any]:
-    return asdict(Config())
+def _moving_peak(space: int, pos: float, amp: float, width: float) -> np.ndarray:
+    """Return a gaussian-shaped bump at position `pos` (wrap around)."""
+    x = np.arange(space, dtype=float)
+    # shortest distance on a ring
+    d = np.minimum(np.abs(x - pos), space - np.abs(x - pos))
+    return amp * np.exp(-(d**2) / (2.0 * max(1e-6, width)**2))
+
+
+def build_env(cfg: FieldCfg, rng: np.random.Generator) -> np.ndarray:
+    """Create env field E[t, x] from sources."""
+    T, X = cfg.frames, cfg.length
+    E = np.zeros((T, X), dtype=float)
+
+    for s in cfg.sources:
+        kind  = s.get("kind", "moving_peak")
+        amp   = float(s.get("amp", 1.0))
+        speed = float(s.get("speed", 0.1)) * X  # speed in cells/frame
+        width = float(s.get("width", 4.0))
+        start = int(s.get("start", 0)) % X
+        if kind != "moving_peak":
+            continue
+
+        pos = float(start)
+        for t in range(T):
+            E[t] += _moving_peak(X, pos, amp, width)
+            pos = (pos + speed) % X
+
+    if cfg.noise_sigma > 0:
+        E += rng.normal(0.0, cfg.noise_sigma, size=E.shape)
+
+    # Clamp to non-negative “free energy”
+    np.maximum(E, 0.0, out=E)
+    return E
+
+
+# =========================
+# History buffers
+# =========================
+
+@dataclass
+class History:
+    t: List[int] = field(default_factory=list)
+    E_cell: List[float] = field(default_factory=list)
+    E_env:  List[float] = field(default_factory=list)
+    E_flux: List[float] = field(default_factory=list)
+
+
+# =========================
+# Engine
+# =========================
 
 class Engine:
-    """
-    Very small ‘cell’ that tries to keep a free‑energy gradient vs environment.
-    We track three emergent channels: SENSE, MOTOR, INTERNAL (not hard-coded as types,
-    only as energy collection mechanisms). No trig; all local, linear, or softplus.
-    """
-    def __init__(self, cfg: Dict[str, Any]):
-        # unpack
+    """Time-step simulation with simple, local rules and streaming callback."""
+    def __init__(self, cfg: Config):
         self.cfg = cfg
-        self.frames = int(cfg.get("frames", 1600))
-        self.rng = _rng(int(cfg.get("seed", 0)))
+        self.rng = np.random.default_rng(cfg.seed)
+        # env and substrate
+        self.env = build_env(cfg.env, self.rng)  # shape (T, X_env)
+        self.T = cfg.frames
+        self.X = cfg.space
+        # substrate state S[t, x] (we keep only current row + for plots we can reconstruct)
+        self.S = np.zeros((self.T, self.X), dtype=float)
+        self.S[0] = 0.0
+        # energies (scalars per-step)
+        self.hist = History()
 
-        # field
-        fcfg = cfg.get("field", {})
-        if isinstance(fcfg, dict):
-            fcfg = FieldCfg(**fcfg)
-        self.field = SpaceTimeField(fcfg)
+    def step(self, t: int) -> Tuple[float, float, float]:
+        """Advance by one step; returns (E_cell, E_env, E_flux) at this t."""
+        cfg = self.cfg
+        # env row for this step; if user set space!=env.length, we tile/crop
+        e_row = self.env[t]
+        if self.env.shape[1] != self.X:
+            # simple resample by modulo (keeps periodicity)
+            idx = (np.arange(self.X) * self.env.shape[1] // self.X) % self.env.shape[1]
+            e_row = e_row[idx]
 
-        # state
-        self.E_cell = 1.0     # internal energy pool
-        self.history: Dict[str, list] = {
-            "E_cell": [], "E_env": [], "E_flux": [],
-            "SENSE": [], "MOTOR": [], "INTERNAL": [],
-        }
-        # persistent “model” of signal (RBF bank learned online)
-        self.M_centers = np.linspace(0, fcfg.space-1, 16)
-        self.M_width = 12.0
-        self.M_weights = np.zeros_like(self.M_centers)
+        # previous substrate
+        prev = self.S[t-1] if t > 0 else self.S[0]
 
-    # --- helper: cheap RBF projection, no trig
-    def _rbf(self, x: np.ndarray, centers: np.ndarray, width: float) -> np.ndarray:
-        # returns [len(x), len(centers)] activations
-        d = x[:, None] - centers[None, :]
-        return np.exp(-(d*d) / (2.0*width*width))
+        # local diffusion + decay
+        left  = np.roll(prev,  1)
+        right = np.roll(prev, -1)
+        S_diffused = prev + cfg.diffuse * (0.5*(left + right) - prev)
+        S_decayed  = (1.0 - cfg.decay) * S_diffused
 
-    def _update_model(self, env_slice: np.ndarray):
-        # one‑step Hebbian-ish update
-        x = np.arange(env_slice.size)
-        Phi = self._rbf(x, self.M_centers, self.M_width)  # [S, M]
-        y = env_slice
-        # local update
-        grad = Phi.T @ y / (y.size + 1e-9)
-        self.M_weights = 0.98*self.M_weights + 0.02*grad
+        # boundary pump: env at boundary x=0 and a small band acts as “free-energy tap”
+        band = 3
+        grad = np.maximum(e_row[:band] - S_decayed[:band], 0.0)
+        pump = np.zeros_like(S_decayed)
+        pump[:band] += cfg.k_flux * grad
 
-    def _predict(self) -> np.ndarray:
-        x = np.arange(self.field.cfg.space)
-        Phi = self._rbf(x, self.M_centers, self.M_width)
-        return Phi @ self.M_weights
+        # motor exploration along boundary band: small random pushes
+        mot = np.zeros_like(S_decayed)
+        mot[:band] += cfg.k_motor * self.rng.random(band)
 
-    # --- single step ---
-    def step(self, t: int):
-        s_t = self.field.slice(t)                 # environment at boundary+interior
-        env_energy = float(np.mean(s_t))          # scalar proxy
+        # update substrate
+        cur = S_decayed + pump + mot
+        self.S[t] = cur
 
-        # SENSE harvest: correlation gain when our model matches env
-        pred = self._predict()
-        match = 1.0 - np.mean(np.abs(s_t - pred)) / (np.mean(np.abs(s_t)) + 1e-9)
-        sense_gain = self.cfg["sense_bias"] * softplus(3.0*match) * 0.2
+        # bookkeeping
+        E_cell = float(np.mean(cur))
+        E_env  = float(np.mean(e_row))
+        E_flux = float(np.sum(pump))
 
-        # MOTOR harvest: push/pull relative to boundary gradient
-        b = self.field.cfg.boundary_idx
-        bwin = s_t[max(0, b-2):min(s_t.size, b+3)]
-        grad = float(np.max(bwin) - np.min(bwin))
-        # small explore term (random “pokes”)
-        explore = self.rng.normal(0, 0.03)
-        motor_gain = self.cfg["motor_bias"] * softplus(grad + explore) * 0.15
+        self.hist.t.append(t)
+        self.hist.E_cell.append(E_cell)
+        self.hist.E_env.append(E_env)
+        self.hist.E_flux.append(E_flux)
 
-        # INTERNAL harvest: maintain temporal slope (cheap memory)
-        if len(self.history["E_env"]) == 0:
-            slope = 0.0
-        else:
-            slope = env_energy - self.history["E_env"][-1]
-        internal_gain = self.cfg["internal_bias"] * softplus(0.8*abs(slope)) * 0.08
+        return E_cell, E_env, E_flux
 
-        # costs
-        activity = sense_gain + motor_gain + internal_gain
-        cost = self.cfg["act_cost"] * activity + self.cfg["leak"] * self.E_cell
-
-        # update energy pool
-        E_flux = (sense_gain + motor_gain + internal_gain) - cost
-        self.E_cell = max(0.0, self.E_cell + E_flux)
-
-        # update world model after “sensing”
-        self._update_model(s_t)
-
-        # log
-        self.history["E_cell"].append(self.E_cell)
-        self.history["E_env"].append(env_energy)
-        self.history["E_flux"].append(E_flux)
-        self.history["SENSE"].append(sense_gain)
-        self.history["MOTOR"].append(motor_gain)
-        self.history["INTERNAL"].append(internal_gain)
-
-    # --- public API ---
-    def run(self, progress_cb=None):
-        for t in range(self.frames):
+    def run(self, progress_cb: Optional[Callable[[int], None]] = None):
+        for t in range(self.T):
             self.step(t)
             if progress_cb is not None:
                 progress_cb(t)
 
-    def get_series(self) -> Dict[str, np.ndarray]:
-        return {k: np.array(v, dtype=float) for k, v in self.history.items()}
 
-    def get_env_frame(self, t: int) -> np.ndarray:
-        t = int(np.clip(t, 0, self.frames-1))
-        return self.field.slice(t)
+# =========================
+# Public helpers
+# =========================
 
-    def perturb_env(self, scale: float = 1.2):
-        self.field.perturb(scale)
+def default_config() -> Dict:
+    """Return a plain dict config (useful for Streamlit session_state)."""
+    return asdict(Config())
 
-    def snapshot(self) -> Dict[str, Any]:
-        out = dict(cfg=self.cfg, field_params=self.field.as_params(), history=self.get_series())
-        return out
-
-# convenience for the UI
-def run_sim(cfg: Dict[str, Any], cb=None) -> Dict[str, np.ndarray]:
+def run_sim(cfg_dict: Dict) -> Tuple[History, np.ndarray, np.ndarray]:
+    """Convenience: build engine from dict and run."""
+    cfg = Config(
+        seed=cfg_dict.get("seed", 0),
+        frames=cfg_dict.get("frames", 1600),
+        space=cfg_dict.get("space", 192),
+        n_init=cfg_dict.get("n_init", 9),
+        k_flux=cfg_dict.get("k_flux", 0.05),
+        k_motor=cfg_dict.get("k_motor", 0.02),
+        decay=cfg_dict.get("decay", 0.01),
+        diffuse=cfg_dict.get("diffuse", 0.15),
+        env=FieldCfg(
+            length=cfg_dict.get("env", {}).get("length", 192),
+            frames=cfg_dict.get("env", {}).get("frames", cfg_dict.get("frames", 1600)),
+            noise_sigma=cfg_dict.get("env", {}).get("noise_sigma", 0.01),
+            sources=cfg_dict.get("env", {}).get("sources", FieldCfg().sources),
+        ),
+    )
     eng = Engine(cfg)
-    eng.run(progress_cb=cb)
-    return eng.get_series()
+    eng.run()
+    return eng.hist, eng.env, eng.S
