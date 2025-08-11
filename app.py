@@ -7,6 +7,10 @@ from typing import Dict, Tuple
 import numpy as np
 import matplotlib.pyplot as plt
 import streamlit as st
+# ensure latest sim_core is used (Streamlit can cache modules)
+from importlib import reload
+import sim_core as sc
+sc = reload(sc)
 
 from sim_core import make_engine, default_config, Engine
 
@@ -144,7 +148,13 @@ if run_btn and ok:
             if vmax_s is None and t > max(20, chunk):
                 vmax_s = float(np.percentile(S_part, 99))
             draw_heatmap(S_part, "Substrate S(t,x)", subs_ph, vmin=0.0, vmax=vmax_s)
+            
+            # draw kernel if present
+            if hasattr(engine, "w") and engine.w is not None:
+                draw_kernel(engine.w, ker_ph)
+            else:
+                ker_ph.info("Kernel not available yet.")
 
-            draw_kernel(engine.w, ker_ph)
+            # draw_kernel(engine.w, ker_ph)
 
     msg_box.success("Done!")
