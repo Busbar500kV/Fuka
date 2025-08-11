@@ -1,199 +1,142 @@
 # app.py
-import time
-import io
+# Streamlit UI for live simulation with adjustable environment sources.
+
+from __future__ import annotations
 import json
-from typing import Dict, Any
+from copy import deepcopy
+from typing import Dict, List
 
 import numpy as np
-import pandas as pd
+import matplotlib.pyplot as plt
 import streamlit as st
-import plotly.graph_objects as go
 
-from sim_core import Engine, default_config, FieldCfg
+from sim_core import Engine, default_config, FieldCfg, Config
 
-st.set_page_config(page_title="Fuka – Free‑Energy Gradient Simulation (Live)", layout="wide")
 
-# ---------------- state helpers ----------------
-def init_state():
-    if "cfg" not in st.session_state:
-        st.session_state.cfg = default_config()
-    if "engine" not in st.session_state:
-        st.session_state.engine = None
-    if "running" not in st.session_state:
-        st.session_state.running = False
-    if "paused" not in st.session_state:
-        st.session_state.paused = False
-    if "history" not in st.session_state:
-        st.session_state.history = None
-    if "runs" not in st.session_state:
-        st.session_state.runs = {}  # name -> snapshot
+st.set_page_config(page_title="Fuka – Free‑Energy Gradient (Live)", layout="wide")
 
-init_state()
+# -----------------------
+# Sidebar controls
+# -----------------------
+st.sidebar.title("Controls")
 
-def new_engine():
-    st.session_state.engine = Engine(st.session_state.cfg)
-    st.session_state.history = st.session_state.engine.get_series()
+# session config dict
+if "cfg" not in st.session_state:
+    st.session_state.cfg = default_config()
+cfg: Dict = st.session_state.cfg
 
-# ---------------- sidebar (controls) ----------------
-with st.sidebar:
-    st.header("Run Controls")
+def clamp(v, lo, hi): return int(max(lo, min(hi, v)))
 
-    cfg: Dict[str, Any] = st.session_state.cfg
-    # high-level
-    cfg["frames"] = st.number_input("Frames", min_value=400, max_value=50000, value=int(cfg["frames"]), step=400)
-    cfg["seed"]   = st.number_input("Seed", min_value=0, max_value=10_000, value=int(cfg["seed"]), step=1)
-    cfg["redraw_every"] = st.slider("Redraw every N ticks", 1, 200, int(cfg.get("redraw_every", 20)))
+# basic knobs
+cfg["seed"]   = st.sidebar.number_input("Seed", 0, 1_000_000, int(cfg.get("seed", 0)), 1)
+cfg["frames"] = clamp(st.sidebar.number_input("Frames", 200, 5000, int(cfg.get("frames", 1600)), 100), 200, 5000)
+cfg["space"]  = clamp(st.sidebar.number_input("Space (cells)", 32, 512, int(cfg.get("space", 192)), 16), 32, 512)
 
-    st.subheader("Energy biases")
-    cfg["sense_bias"]    = st.slider("Sense bias",    0.0, 1.0, float(cfg.get("sense_bias", 0.3)))
-    cfg["motor_bias"]    = st.slider("Motor bias",    0.0, 1.0, float(cfg.get("motor_bias", 0.3)))
-    cfg["internal_bias"] = st.slider("Internal bias", 0.0, 1.0, float(cfg.get("internal_bias", 0.4)))
+# dynamics
+cols = st.sidebar.columns(2)
+cfg["k_flux"]  = float(cols[0].number_input("k_flux", 0.0, 1.0, float(cfg.get("k_flux", 0.05)), 0.01))
+cfg["k_motor"] = float(cols[1].number_input("k_motor", 0.0, 1.0, float(cfg.get("k_motor", 0.02)), 0.01))
+cols = st.sidebar.columns(2)
+cfg["diffuse"] = float(cols[0].number_input("diffuse", 0.0, 1.0, float(cfg.get("diffuse", 0.15)), 0.01))
+cfg["decay"]   = float(cols[1].number_input("decay", 0.0, 0.5, float(cfg.get("decay", 0.01)), 0.005))
 
-    st.subheader("Environment (space‑time)")
-    f = cfg.get("field", {})
-    if isinstance(f, dict):
-        f = FieldCfg(**f)
+# environment / sources
+env = cfg.setdefault("env", {})
+env["length"]     = clamp(st.sidebar.number_input("Env length", 32, 512, int(env.get("length", cfg["space"])), 16), 32, 512)
+env["frames"]     = cfg["frames"]
+env["noise_sigma"]= float(st.sidebar.number_input("Env noise σ", 0.0, 0.5, float(env.get("noise_sigma", 0.01)), 0.01))
 
-    f.space       = st.slider("Space size", 64, 512, int(f.space), step=8)
-    f.K           = st.slider("DoF (K kernels)", 1, 24, int(f.K))
-    f.amp         = st.slider("Amplitude", 0.1, 4.0, float(f.amp))
-    f.width_min   = st.slider("Width min", 2.0, 32.0, float(f.width_min))
-    f.width_max   = st.slider("Width max", 4.0, 64.0, float(f.width_max))
-    f.speed_min   = st.slider("Speed min", 0.0, 3.0, float(f.speed_min))
-    f.speed_max   = st.slider("Speed max", 0.1, 5.0, float(f.speed_max))
-    f.boundary_idx = st.slider("Boundary index", 0, f.space-1, int(f.boundary_idx))
-    f.offset      = st.slider("Global offset", 0, f.space-1, int(f.offset))
-    f.preset      = st.selectbox("Shape preset", ["gauss", "ridge", "blob"], index=["gauss","ridge","blob"].index(f.preset))
+# sources JSON
+default_sources = FieldCfg().sources
+if "sources" not in env:
+    env["sources"] = deepcopy(default_sources)
 
-    cfg["field"] = f.__dict__  # write back
+st.sidebar.markdown("**Sources JSON** (list)")
+src_text = st.sidebar.text_area("Edit env sources",
+                                value=json.dumps(env["sources"], indent=2),
+                                height=240)
+try:
+    env["sources"] = json.loads(src_text)
+    st.sidebar.success("Sources OK")
+except Exception as e:
+    st.sidebar.error(f"Invalid JSON for sources: {e}")
 
-    st.divider()
-    colA, colB, colC = st.columns(3)
-    with colA:
-        if st.button("Start / Restart", use_container_width=True):
-            new_engine()
-            st.session_state.running = True
-            st.session_state.paused = False
-            st.toast("Started")
-    with colB:
-        if st.button("Pause/Resume", use_container_width=True):
-            if st.session_state.running:
-                st.session_state.paused = not st.session_state.paused
-                st.toast("Paused" if st.session_state.paused else "Resumed")
-    with colC:
-        if st.button("Stop", use_container_width=True):
-            st.session_state.running = False
-            st.session_state.paused = False
-            st.toast("Stopped")
+# run controls
+col_run = st.sidebar.container()
+live_mode = col_run.checkbox("Live streaming", True)
+chunk = col_run.slider("Refresh chunk (frames)", 10, 200, 50, 10)
+run_btn = col_run.button("Run / Restart", type="primary")
 
-    st.subheader("Live Perturbations")
-    if st.button("Increase free energy ×1.2"):
-        if st.session_state.engine:
-            st.session_state.engine.perturb_env(1.2)
-            st.toast("Environment boosted")
 
-    st.subheader("Autosave / History")
-    run_name = st.text_input("Save name", value=f"run_{int(time.time())}")
-    if st.button("Save snapshot"):
-        if st.session_state.engine:
-            snap = st.session_state.engine.snapshot()
-            st.session_state.runs[run_name] = snap
-            st.toast(f"Saved {run_name}")
-    pick = st.selectbox("Load snapshot", ["—"] + list(st.session_state.runs.keys()))
-    if pick != "—":
-        snap = st.session_state.runs[pick]
-        st.session_state.cfg = snap["cfg"]
-        new_engine()
-        # load history (we keep current engine, history is just for plots)
-        st.session_state.history = {k: np.array(v) for k, v in snap["history"].items()}
-        st.toast(f"Loaded {pick}")
-
+# -----------------------
+# Main area
+# -----------------------
 st.title("Fuka – Free‑Energy Gradient Simulation (Live)")
 status = st.empty()
+fig_placeholder = st.empty()
+heat_cols = st.columns(2)
+env_ph = heat_cols[0].empty()
+S_ph   = heat_cols[1].empty()
 
-# --------- charts ---------
-charts = st.container()
-with charts:
-    c1, c2 = st.columns([2, 1])
-    with c1:
-        fig_energy = go.Figure()
-        fig_energy.update_layout(height=300, margin=dict(l=20, r=20, t=10, b=10))
-        energy_plot = st.plotly_chart(fig_energy, use_container_width=True)
-    with c2:
-        fig_roles = go.Figure()
-        fig_roles.update_layout(height=300, margin=dict(l=20, r=20, t=10, b=10))
-        roles_plot = st.plotly_chart(fig_roles, use_container_width=True)
+def plot_heat(ax, M, title: str):
+    ax.imshow(M.T, aspect="auto", origin="lower", interpolation="nearest")
+    ax.set_title(title)
+    ax.set_xlabel("frame")
+    ax.set_ylabel("space")
 
-    c3, c4 = st.columns([2, 1])
-    with c3:
-        env_plot = st.plotly_chart(go.Figure().update_layout(height=240, margin=dict(l=20,r=20,t=10,b=10)),
-                                   use_container_width=True)
-    with c4:
-        # download CSV
-        if st.session_state.history is not None:
-            df = pd.DataFrame(st.session_state.history)
-            csv = df.to_csv(index=False).encode("utf-8")
-            st.download_button("Download CSV", data=csv, file_name="fuka_run.csv", mime="text/csv", use_container_width=True)
+def redraw(t: int, eng: Engine):
+    # line chart of energies
+    fig, ax = plt.subplots(figsize=(8, 3))
+    ax.plot(eng.hist.t, eng.hist.E_cell, label="E_cell")
+    ax.plot(eng.hist.t, eng.hist.E_env,  label="E_env")
+    ax.plot(eng.hist.t, eng.hist.E_flux, label="E_flux")
+    ax.set_xlim(0, eng.T-1)
+    ax.legend(loc="upper left")
+    ax.grid(alpha=0.2)
+    fig_placeholder.pyplot(fig)
+    plt.close(fig)
 
-# --------- drawing helpers ---------
-def redraw(tick: int):
-    status.success("Running…" if st.session_state.running else "Done!")
-    hist = st.session_state.engine.get_series() if st.session_state.engine else st.session_state.history
-    if hist is None or len(hist["E_cell"]) == 0:
-        return
-    st.session_state.history = hist  # keep last for download
+    # env & substrate heatmaps
+    f2, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 3.2))
+    plot_heat(ax1, eng.env[:t+1], "Environment E(t,x)")
+    plot_heat(ax2, eng.S[:t+1],   "Substrate S(t,x)")
+    env_ph.pyplot(f2)
+    plt.close(f2)
 
-    # Energy curves
-    x = np.arange(len(hist["E_cell"]))
-    fig_energy = go.Figure()
-    fig_energy.add_scatter(x=x, y=hist["E_cell"], name="E_cell")
-    fig_energy.add_scatter(x=x, y=hist["E_env"],  name="E_env")
-    fig_energy.add_scatter(x=x, y=hist["E_flux"], name="E_flux")
-    fig_energy.update_layout(height=300, margin=dict(l=20, r=20, t=10, b=10), legend=dict(orientation="h"))
-    energy_plot.plotly_chart(fig_energy, use_container_width=True)
+if run_btn:
+    status.info("Starting…")
+    # Build Engine from current cfg
+    cfg_dict = deepcopy(cfg)
+    cfg_dict["env"]["frames"] = cfg_dict["frames"]  # keep in sync
+    engine = Engine(Config(
+        seed=cfg_dict["seed"],
+        frames=cfg_dict["frames"],
+        space=cfg_dict["space"],
+        n_init=cfg_dict.get("n_init", 9),
+        k_flux=cfg_dict["k_flux"],
+        k_motor=cfg_dict["k_motor"],
+        decay=cfg_dict["decay"],
+        diffuse=cfg_dict["diffuse"],
+        env=FieldCfg(
+            length=cfg_dict["env"]["length"],
+            frames=cfg_dict["frames"],
+            noise_sigma=cfg_dict["env"]["noise_sigma"],
+            sources=cfg_dict["env"]["sources"],
+        ),
+    ))
 
-    # Roles over time
-    fig_roles = go.Figure()
-    for k in ["SENSE","MOTOR","INTERNAL"]:
-        fig_roles.add_scatter(x=x, y=hist[k], name=k)
-    fig_roles.update_layout(height=300, margin=dict(l=20, r=20, t=10, b=10), legend=dict(orientation="h"))
-    roles_plot.plotly_chart(fig_roles, use_container_width=True)
+    if live_mode:
+        last = [0]  # mutable to capture inside callback
 
-    # Environment snapshot at current tick
-    env = st.session_state.engine.get_env_frame(min(tick, len(x)-1)) if st.session_state.engine else None
-    if env is not None:
-        fig_env = go.Figure()
-        fig_env.add_bar(x=list(range(env.size)), y=env, name="env slice")
-        fig_env.update_layout(height=240, margin=dict(l=20, r=20, t=10, b=10), showlegend=False)
-        env_plot.plotly_chart(fig_env, use_container_width=True)
+        def cb(t: int):
+            if (t - last[0] >= chunk) or (t == engine.T - 1):
+                last[0] = t
+                redraw(t, engine)
 
-# --------- main loop (cooperative, Streamlit-friendly) ---------
-def run_loop():
-    eng = st.session_state.engine
-    if not eng:
-        return
-    chunk = int(st.session_state.cfg.get("redraw_every", 20))
-    # run small chunks, then rerun page
-    for _ in range(chunk):
-        # if paused or stopped, break out
-        if not st.session_state.running or st.session_state.paused:
-            break
-        t_now = len(eng.history["E_cell"])
-        if t_now >= eng.frames:
-            st.session_state.running = False
-            break
-        eng.step(t_now)
-    redraw(len(eng.history["E_cell"]) - 1)
-    # schedule another pass while running
-    if st.session_state.running and not st.session_state.paused:
-        time.sleep(0.05)
-        st.experimental_rerun()
+        engine.run(progress_cb=cb)
+        redraw(engine.T - 1, engine)
+    else:
+        engine.run()
+        redraw(engine.T - 1, engine)
 
-# kick off
-if st.session_state.running:
-    run_loop()
-else:
     status.success("Done!")
-    if st.session_state.engine is None:
-        new_engine()
-    redraw(0)
