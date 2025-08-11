@@ -1,4 +1,6 @@
-# sim_core.py — Sliding-gate motor with adaptive intake kernel (emergent sensor)
+# sim_core.py
+# Core free‑energy gradient sim with a learned temporal gate (sensing DoF)
+# and a movable boundary driven by a local motor. Designed for live streaming.
 
 from __future__ import annotations
 from dataclasses import dataclass, asdict, field
@@ -26,53 +28,51 @@ class FieldCfg:
 class Config:
     seed: int = 0
     frames: int = 5000
-    space: int = 64
+    space: int = 64  # substrate width (cells)
+    # energy / dynamics knobs
+    k_flux: float = 0.08       # boundary flux strength (when gate is open)
+    k_motor: float = 1.00      # motor exploration magnitude (dimensionless)
+    motor_noise: float = 0.02  # jitter in motor command
+    c_motor: float = 0.80      # energetic cost per unit motor work
+    decay: float = 0.01        # substrate local decay
+    diffuse: float = 0.15      # substrate diffusion strength
+    band: int = 2              # boundary width (cells affected by gate & motor)
 
-    # substrate dynamics
-    decay: float = 0.01
-    diffuse: float = 0.15
-
-    # boundary band
-    band: int = 3               # boundary width (cells at x=[0..band-1])
-
-    # motor / gate movement
-    k_motor: float = 0.40       # motor command gain
-    motor_noise: float = 0.02   # small motor jitter
-    c_motor: float = 0.02       # motor work cost (energy debit per |u|)
-
-    # intake (flux) from environment
-    k_flux: float = 0.08        # how strongly intake adds to boundary
-    # adaptive kernel ("sensor") over an env window around the gate
-    gate_win: int = 8           # window half-width K -> size=2K+1
-    eta: float = 0.02           # learning rate
-    ema_beta: float = 0.10      # EMA speed for local prediction baseline
-    lam_l1: float = 0.001       # L1 shrinkage
-    prune_thresh: float = 1e-3  # small weight prune
+    # temporal gate (emergent sensing) params
+    gate_win: int = 30         # half window K => kernel len = 2K+1
+    eta: float = 0.02          # kernel learning rate
+    ema_beta: float = 0.10     # EMA for reward baseline
+    lam_l1: float = 0.10       # L1 shrinkage
+    prune_thresh: float = 0.10 # magnitude below which weights are pruned to 0
 
     env: FieldCfg = field(default_factory=FieldCfg)
 
 
 # =========================
-# Environment builders
+# Helper: environment field
 # =========================
 
 def _moving_peak(space: int, pos: float, amp: float, width: float) -> np.ndarray:
-    """Gaussian bump at circular position `pos`."""
+    """Return a gaussian-shaped bump at position `pos` (wrap around)."""
     x = np.arange(space, dtype=float)
+    # shortest distance on a ring
     d = np.minimum(np.abs(x - pos), space - np.abs(x - pos))
     return amp * np.exp(-(d**2) / (2.0 * max(1e-6, width)**2))
 
+
 def build_env(cfg: FieldCfg, rng: np.random.Generator) -> np.ndarray:
-    """Create env field E[t, x] from sources (periodic in space)."""
+    """Create env field E[t, x] from sources."""
     T, X = cfg.frames, cfg.length
     E = np.zeros((T, X), dtype=float)
+
     for s in cfg.sources:
-        if s.get("kind", "moving_peak") != "moving_peak":
-            continue
+        kind  = s.get("kind", "moving_peak")
         amp   = float(s.get("amp", 1.0))
-        speed = float(s.get("speed", 0.0)) * X  # cells per frame
+        speed = float(s.get("speed", 0.0)) * X  # speed in cells/frame
         width = float(s.get("width", 4.0))
         start = int(s.get("start", 0)) % X
+        if kind != "moving_peak":
+            continue
 
         pos = float(start)
         for t in range(T):
@@ -82,6 +82,7 @@ def build_env(cfg: FieldCfg, rng: np.random.Generator) -> np.ndarray:
     if cfg.noise_sigma > 0:
         E += rng.normal(0.0, cfg.noise_sigma, size=E.shape)
 
+    # Clamp to non-negative “free energy”
     np.maximum(E, 0.0, out=E)
     return E
 
@@ -96,7 +97,7 @@ class History:
     E_cell: List[float] = field(default_factory=list)
     E_env:  List[float] = field(default_factory=list)
     E_flux: List[float] = field(default_factory=list)
-    gate_pos: List[float] = field(default_factory=list)
+    reward: List[float]  = field(default_factory=list)
 
 
 # =========================
@@ -104,122 +105,141 @@ class History:
 # =========================
 
 class Engine:
-    """Time-step simulation with sliding gate and adaptive intake kernel."""
+    """Time-step simulation with local rules, temporal gate, and streaming callback."""
     def __init__(self, cfg: Config):
         self.cfg = cfg
         self.rng = np.random.default_rng(cfg.seed)
 
-        # fields
-        self.env = build_env(cfg.env, self.rng)  # (T, X_env)
-        self.T   = cfg.frames
-        self.X   = cfg.space
-        self.Xe  = self.env.shape[1]
+        # env and substrate
+        self.env = build_env(cfg.env, self.rng)  # shape (T, X_env)
+        self.T = cfg.frames
+        self.X = cfg.space
 
-        # substrate
+        # substrate state S[t, x]
         self.S = np.zeros((self.T, self.X), dtype=float)
+        self.S[0] = 0.0
 
-        # gate state & kernel
-        self.gate_pos = float(0.0)                 # index in env space [0, Xe)
+        # boundary (movable) index; 0 means left edge, we keep the band inside [0, X)
+        self.bound = 0
+
+        # gate kernel
         K = cfg.gate_win
-        self.w = np.abs(self.rng.normal(0.0, 1e-2, size=(2*K+1,)))  # small non-negative start
-        s = np.sum(self.w)
-        if s > 0: self.w /= s
-        self.ema_win = np.zeros_like(self.w)        # EMA baseline of window values
+        self.K = K
+        self.w = np.zeros(2*K + 1, dtype=float)
+        self.ema_baseline = 0.0
 
+        # circular buffer of boundary samples for gate
+        self._buf = np.zeros(2*K + 1, dtype=float)
+        self._buf_idx = 0
+
+        # live kernel history (downsampled; filled by run())
+        self.w_hist_times: List[int] = []
+        self.w_hist: List[np.ndarray] = []
+
+        # energies (scalars per-step)
         self.hist = History()
 
-    # ---- helpers
-    def _resample_e_row(self, t: int) -> np.ndarray:
-        """Return env slice at time t, possibly resampled to X."""
-        e_row = self.env[t]
-        if self.Xe == self.X:
-            return e_row
-        idx = (np.arange(self.X) * self.Xe // self.X) % self.Xe
-        return e_row[idx]
+    # ---- gate helpers ----
+    def _buf_push(self, v: float):
+        self._buf[self._buf_idx] = v
+        self._buf_idx = (self._buf_idx + 1) % self._buf.size
 
-    def _take_env_window(self, e_row_full: np.ndarray) -> np.ndarray:
-        """Local env window around the gate (size 2K+1) from full env (length Xe)."""
-        K = self.cfg.gate_win
-        c = int(np.floor(self.gate_pos)) % self.Xe
-        idx = (np.arange(c-K, c+K+1) % self.Xe)
-        return e_row_full[idx]
+    def _buf_read(self) -> np.ndarray:
+        # return in chronological order (oldest .. newest)
+        i = self._buf_idx
+        return np.concatenate([self._buf[i:], self._buf[:i]])
 
-    # ---- core step
+    # ---- one step ----
     def step(self, t: int) -> Tuple[float, float, float]:
         cfg = self.cfg
 
-        # env rows
-        e_row_full = self.env[t]              # for gate window (length Xe)
-        e_row      = self._resample_e_row(t)  # for boundary gradient against substrate (length X)
+        # env row for this step; if user set space!=env.length, we resample by modulo
+        e_row_full = self.env[t]
+        if self.env.shape[1] != self.X:
+            idx = (np.arange(self.X) * self.env.shape[1] // self.X) % self.env.shape[1]
+            e_row = e_row_full[idx]
+        else:
+            e_row = e_row_full
+
+        # sample env at the current boundary cell for gate buffer
+        boundary_cell = self.bound % self.X
+        self._buf_push(float(e_row[boundary_cell]))
 
         # previous substrate
         prev = self.S[t-1] if t > 0 else self.S[0]
 
-        # local diffusion + decay on ring
+        # local diffusion + decay
         left  = np.roll(prev,  1)
         right = np.roll(prev, -1)
         S_diffused = prev + cfg.diffuse * (0.5*(left + right) - prev)
         S_decayed  = (1.0 - cfg.decay) * S_diffused
 
-        # ========== intake (emergent sensing)
-        win = self._take_env_window(e_row_full)                   # size 2K+1
-        # adaptive kernel dot the window
-        intake_raw = float(np.dot(self.w, win))                   # scalar
-        # compare to boundary level (mean over band)
-        bmean = float(np.mean(S_decayed[:cfg.band]))
-        intake = cfg.k_flux * max(intake_raw - bmean, 0.0)
+        # ---- temporal gate (logistic) ----
+        hist_window = self._buf_read()  # len = 2K+1
+        # center-align: newest sample is at index 2K (end)
+        # simple mean baseline to de-bias input to gate
+        x_gate = hist_window - np.mean(hist_window)
+        z = float(np.dot(self.w, x_gate))
+        gate = 1.0 / (1.0 + np.exp(-z))  # in (0,1)
+
+        # ---- boundary pump & motor ----
+        b0 = self.bound % self.X
+        band_idx = (b0 + np.arange(cfg.band)) % self.X
+
+        # flux only when env > substrate in band
+        grad = np.maximum(e_row[band_idx] - S_decayed[band_idx], 0.0)
+        pump_band = cfg.k_flux * gate * grad
 
         pump = np.zeros_like(S_decayed)
-        if cfg.band > 0:
-            pump[:cfg.band] += intake / cfg.band
+        pump[band_idx] += pump_band
 
-        # ========== motor: move gate along env ring
-        # crude directional bias: difference between right/left halves of the window
-        K = cfg.gate_win
-        bias = float(np.sum(win[K+1:]) - np.sum(win[:K])) / max(1.0, np.sum(win))
-        u = cfg.k_motor * bias + cfg.motor_noise * self.rng.normal()
-        self.gate_pos = (self.gate_pos + u) % self.Xe
+        # motor tries to shift the boundary in direction of strongest local gradient
+        g_left  = float(np.sum(np.maximum(e_row[(b0-1) % self.X] - S_decayed[(b0-1) % self.X], 0.0)))
+        g_right = float(np.sum(np.maximum(e_row[(b0+cfg.band) % self.X] - S_decayed[(b0+cfg.band) % self.X], 0.0)))
+        dir_pref = np.sign(g_right - g_left)  # +1 move right, -1 left, 0 none
 
-        # motor energetic cost: subtract uniformly from boundary (can’t go below 0)
-        debit = cfg.c_motor * abs(u)
-        if debit > 0:
-            debt = debit / max(1, cfg.band)
-            S_decayed[:cfg.band] = np.maximum(0.0, S_decayed[:cfg.band] - debt)
+        motor_cmd = cfg.k_motor * dir_pref + cfg.motor_noise * self.rng.normal()
+        move = int(np.clip(round(motor_cmd), -1, 1))
+        work = abs(motor_cmd)
+        self.bound = (self.bound + move) % self.X
 
-        # ========== update substrate
+        # update substrate
         cur = S_decayed + pump
         self.S[t] = cur
-
-        # ========== local plasticity (online, purely local to the boundary)
-        # EMA baseline of the env window (predictable background)
-        self.ema_win = (1.0 - cfg.ema_beta) * self.ema_win + cfg.ema_beta * win
-        err = win - self.ema_win               # “surprise” drive
-        a = float(np.mean(cur[:cfg.band]))     # boundary activity (proxy for harvested energy)
-        self.w += cfg.eta * a * err            # Hebbian-like, driven by surprise
-        # L1 shrink & prune
-        self.w -= cfg.lam_l1 * np.sign(self.w)
-        self.w[np.abs(self.w) < cfg.prune_thresh] = 0.0
-        # keep kernel bounded (energy‑neutral scaling)
-        s = float(np.sum(np.abs(self.w)))
-        if s > 0:
-            self.w /= s
 
         # bookkeeping
         E_cell = float(np.mean(cur))
         E_env  = float(np.mean(e_row))
-        E_flux = float(np.sum(pump[:cfg.band]))
+        E_flux = float(np.sum(pump_band))
+
+        # reward: flux revenue minus motor cost
+        r = E_flux - cfg.c_motor * work
+        # gate update: REINFORCE‑style baseline
+        self.ema_baseline = (1.0 - cfg.ema_beta) * self.ema_baseline + cfg.ema_beta * r
+        adv = r - self.ema_baseline
+        grad_w = adv * x_gate  # ∂logπ/∂w ≈ x_gate for logistic gate
+        self.w += cfg.eta * grad_w
+
+        # L1 shrink + prune
+        self.w = np.sign(self.w) * np.maximum(0.0, np.abs(self.w) - cfg.lam_l1 * cfg.eta)
+        self.w[np.abs(self.w) < cfg.prune_thresh] = 0.0
 
         self.hist.t.append(t)
         self.hist.E_cell.append(E_cell)
         self.hist.E_env.append(E_env)
         self.hist.E_flux.append(E_flux)
-        self.hist.gate_pos.append(self.gate_pos)
+        self.hist.reward.append(r)
 
         return E_cell, E_env, E_flux
 
-    def run(self, progress_cb: Optional[Callable[[int], None]] = None):
+    def run(self, progress_cb: Optional[Callable[[int], None]] = None,
+            snapshot_every: int = 100):
         for t in range(self.T):
             self.step(t)
+            if (t % snapshot_every) == 0:
+                # store kernel snapshot
+                self.w_hist_times.append(t)
+                self.w_hist.append(self.w.copy())
             if progress_cb is not None:
                 progress_cb(t)
 
@@ -229,26 +249,31 @@ class Engine:
 # =========================
 
 def default_config() -> Dict:
-    """Return a plain dict config (handy for Streamlit session_state)."""
+    """Return a plain dict config (useful for Streamlit session_state)."""
     return asdict(Config())
 
+
 def make_engine(cfg_dict: Dict) -> Engine:
+    """Make an Engine from a plain dict."""
     cfg = Config(
-        seed=int(cfg_dict.get("seed", 0)),
+        seed=cfg_dict.get("seed", 0),
         frames=int(cfg_dict.get("frames", 5000)),
         space=int(cfg_dict.get("space", 64)),
+
+        k_flux=float(cfg_dict.get("k_flux", 0.08)),
+        k_motor=float(cfg_dict.get("k_motor", 1.0)),
+        motor_noise=float(cfg_dict.get("motor_noise", 0.02)),
+        c_motor=float(cfg_dict.get("c_motor", 0.80)),
         decay=float(cfg_dict.get("decay", 0.01)),
         diffuse=float(cfg_dict.get("diffuse", 0.15)),
-        band=int(cfg_dict.get("band", 3)),
-        k_motor=float(cfg_dict.get("k_motor", 0.40)),
-        motor_noise=float(cfg_dict.get("motor_noise", 0.02)),
-        c_motor=float(cfg_dict.get("c_motor", 0.02)),
-        k_flux=float(cfg_dict.get("k_flux", 0.08)),
-        gate_win=int(cfg_dict.get("gate_win", 8)),
+        band=int(cfg_dict.get("band", 2)),
+
+        gate_win=int(cfg_dict.get("gate_win", 30)),
         eta=float(cfg_dict.get("eta", 0.02)),
         ema_beta=float(cfg_dict.get("ema_beta", 0.10)),
-        lam_l1=float(cfg_dict.get("lam_l1", 0.001)),
-        prune_thresh=float(cfg_dict.get("prune_thresh", 1e-3)),
+        lam_l1=float(cfg_dict.get("lam_l1", 0.10)),
+        prune_thresh=float(cfg_dict.get("prune_thresh", 0.10)),
+
         env=FieldCfg(
             length=int(cfg_dict.get("env", {}).get("length", 512)),
             frames=int(cfg_dict.get("env", {}).get("frames", cfg_dict.get("frames", 5000))),
@@ -257,8 +282,3 @@ def make_engine(cfg_dict: Dict) -> Engine:
         ),
     )
     return Engine(cfg)
-
-def run_sim(cfg_dict: Dict) -> Tuple[History, np.ndarray, np.ndarray]:
-    eng = make_engine(cfg_dict)
-    eng.run()
-    return eng.hist, eng.env, eng.S
