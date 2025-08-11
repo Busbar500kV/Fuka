@@ -1,142 +1,180 @@
 # app.py
-# Streamlit UI for live simulation with adjustable environment sources.
+# Streamlit frontend with live streaming, JSON sources, and boundary offset plot.
 
-from __future__ import annotations
 import json
-from copy import deepcopy
-from typing import Dict, List
+from typing import Dict, Any, List
 
 import numpy as np
-import matplotlib.pyplot as plt
 import streamlit as st
+import matplotlib.pyplot as plt
 
-from sim_core import Engine, default_config, FieldCfg, Config
-
-
-st.set_page_config(page_title="Fuka – Free‑Energy Gradient (Live)", layout="wide")
-
-# -----------------------
-# Sidebar controls
-# -----------------------
-st.sidebar.title("Controls")
-
-# session config dict
-if "cfg" not in st.session_state:
-    st.session_state.cfg = default_config()
-cfg: Dict = st.session_state.cfg
-
-def clamp(v, lo, hi): return int(max(lo, min(hi, v)))
-
-# basic knobs
-cfg["seed"]   = st.sidebar.number_input("Seed", 0, 1_000_000, int(cfg.get("seed", 0)), 1)
-cfg["frames"] = clamp(st.sidebar.number_input("Frames", 200, 20000, int(cfg.get("frames", 10000)), 100), 200, 20000)
-cfg["space"]  = clamp(st.sidebar.number_input("Space (cells)", 32, 512, int(cfg.get("space", 192)), 16), 32, 512)
-
-# dynamics
-cols = st.sidebar.columns(2)
-cfg["k_flux"]  = float(cols[0].number_input("k_flux", 0.0, 1.0, float(cfg.get("k_flux", 0.04)), 0.01))
-cfg["k_motor"] = float(cols[1].number_input("k_motor", 0.0, 3.0, float(cfg.get("k_motor", 2.0)), 0.01))
-cols = st.sidebar.columns(2)
-cfg["diffuse"] = float(cols[0].number_input("diffuse", 0.0, 1.0, float(cfg.get("diffuse", 0.06)), 0.01))
-cfg["decay"]   = float(cols[1].number_input("decay", 0.0, 0.5, float(cfg.get("decay", 0.01)), 0.002))
-
-# environment / sources
-env = cfg.setdefault("env", {})
-env["length"]     = clamp(st.sidebar.number_input("Env length", 32, 512, int(env.get("length", cfg["space"])), 16), 32, 512)
-env["frames"]     = cfg["frames"]
-env["noise_sigma"]= float(st.sidebar.number_input("Env noise σ", 0.0, 0.5, float(env.get("noise_sigma", 0.01)), 0.01))
-
-# sources JSON
-default_sources = FieldCfg().sources
-if "sources" not in env:
-    env["sources"] = deepcopy(default_sources)
-
-st.sidebar.markdown("**Sources JSON** (list)")
-src_text = st.sidebar.text_area("Edit env sources",
-                                value=json.dumps(env["sources"], indent=2),
-                                height=240)
-try:
-    env["sources"] = json.loads(src_text)
-    st.sidebar.success("Sources OK")
-except Exception as e:
-    st.sidebar.error(f"Invalid JSON for sources: {e}")
-
-# run controls
-col_run = st.sidebar.container()
-live_mode = col_run.checkbox("Live streaming", True)
-chunk = col_run.slider("Refresh chunk (frames)", 10, 200, 50, 10)
-run_btn = col_run.button("Run / Restart", type="primary")
+from sim_core import Engine, default_config, FieldCfg
 
 
-# -----------------------
-# Main area
-# -----------------------
+st.set_page_config(page_title="Fuka – Free‑Energy Gradient Simulation (Live)",
+                   layout="wide")
+
 st.title("Fuka – Free‑Energy Gradient Simulation (Live)")
-status = st.empty()
-fig_placeholder = st.empty()
-heat_cols = st.columns(2)
-env_ph = heat_cols[0].empty()
-S_ph   = heat_cols[1].empty()
 
-def plot_heat(ax, M, title: str):
-    ax.imshow(M.T, aspect="auto", origin="lower", interpolation="nearest")
-    ax.set_title(title)
+# --------------------------
+# Sidebar controls
+# --------------------------
+with st.sidebar:
+    st.header("Controls")
+
+    # Load defaults (dict) and then expose widgets
+    cfg: Dict[str, Any] = default_config()
+
+    seed   = st.number_input("Seed", 0, 10_000, value=cfg["seed"], step=1)
+    frames = st.number_input("Frames", 100, 100_000, value=cfg["frames"], step=500)
+    space  = st.number_input("Space (cells)", 8, 1024, value=cfg["space"], step=8)
+
+    k_flux   = st.number_input("k_flux", 0.0, 10.0, value=float(cfg["k_flux"]), step=0.01)
+    k_motor  = st.number_input("k_motor (offset motor gain)", 0.0, 10.0, value=float(cfg["k_motor"]), step=0.05)
+    k_noise  = st.number_input("k_noise (direct band noise)", 0.0, 1.0, value=float(cfg["k_noise"]), step=0.01)
+    diffuse  = st.number_input("diffuse", 0.0, 1.0, value=float(cfg["diffuse"]), step=0.01)
+    decay    = st.number_input("decay", 0.0, 1.0, value=float(cfg["decay"]), step=0.005)
+    band     = st.number_input("boundary band size", 1, 16, value=int(cfg["band"]), step=1)
+
+    st.markdown("### Environment")
+    env_len  = st.number_input("Env length", 16, 8192, value=int(cfg["env"]["length"]), step=16)
+    env_sig  = st.number_input("Env noise σ", 0.0, 1.0, value=float(cfg["env"]["noise_sigma"]), step=0.01)
+
+    st.markdown("**Sources JSON (list)**")
+    default_sources = json.dumps(cfg["env"]["sources"], indent=2)
+    sources_txt = st.text_area("Edit env sources", value=default_sources, height=180)
+    sources_ok = True
+    try:
+        sources_list: List[Dict[str, Any]] = json.loads(sources_txt)
+        if not isinstance(sources_list, list):
+            raise ValueError("Sources JSON must be a list")
+        st.success("Sources OK")
+    except Exception as e:
+        sources_ok = False
+        st.error(f"Sources JSON error: {e}")
+
+    live = st.checkbox("Live streaming", value=True)
+    chunk = st.slider("Refresh chunk (frames)", 50, 1000, 200, 10)
+
+# Stitch config
+cfg_out: Dict[str, Any] = {
+    "seed": int(seed),
+    "frames": int(frames),
+    "space": int(space),
+    "k_flux": float(k_flux),
+    "k_motor": float(k_motor),
+    "k_noise": float(k_noise),
+    "diffuse": float(diffuse),
+    "decay": float(decay),
+    "band": int(band),
+    "env": {
+        "length": int(env_len),
+        "frames": int(frames),          # keep env timeline aligned with sim
+        "noise_sigma": float(env_sig),
+        "sources": sources_list if sources_ok else FieldCfg().sources,
+    },
+}
+
+# --------------------------
+# Run button
+# --------------------------
+start = st.button("Start / Restart")
+
+# Placeholders for plots
+status_box = st.empty()
+chart_energy = st.empty()
+col_env, col_subs = st.columns(2)
+env_img_pl = col_env.empty()
+subs_img_pl = col_subs.empty()
+offset_chart = st.empty()
+
+def draw_energy(hist_t, E_cell, E_env, E_flux):
+    fig, ax = plt.subplots(figsize=(6.8, 3))
+    ax.plot(hist_t, E_cell, label="E_cell")
+    ax.plot(hist_t, E_env,  label="E_env")
+    ax.plot(hist_t, E_flux, label="E_flux")
     ax.set_xlabel("frame")
-    ax.set_ylabel("space")
-
-def redraw(t: int, eng: Engine):
-    # line chart of energies
-    fig, ax = plt.subplots(figsize=(8, 3))
-    ax.plot(eng.hist.t, eng.hist.E_cell, label="E_cell")
-    ax.plot(eng.hist.t, eng.hist.E_env,  label="E_env")
-    ax.plot(eng.hist.t, eng.hist.E_flux, label="E_flux")
-    ax.set_xlim(0, eng.T-1)
     ax.legend(loc="upper left")
-    ax.grid(alpha=0.2)
-    fig_placeholder.pyplot(fig)
+    ax.grid(True, alpha=0.3)
+    chart_energy.pyplot(fig)
     plt.close(fig)
 
-    # env & substrate heatmaps
-    f2, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 3.2))
-    plot_heat(ax1, eng.env[:t+1], "Environment E(t,x)")
-    plot_heat(ax2, eng.S[:t+1],   "Substrate S(t,x)")
-    env_ph.pyplot(f2)
-    plt.close(f2)
+def draw_heatmap_env(env, upto):
+    # env: (T, X_env)
+    fig, ax = plt.subplots(figsize=(6.4, 4))
+    ax.imshow(env[:upto].T, aspect="auto", origin="lower",
+              interpolation="nearest")
+    ax.set_title("Environment E(t, x)")
+    ax.set_xlabel("frame"); ax.set_ylabel("space")
+    env_img_pl.pyplot(fig)
+    plt.close(fig)
 
-if run_btn:
-    status.info("Starting…")
-    # Build Engine from current cfg
-    cfg_dict = deepcopy(cfg)
-    cfg_dict["env"]["frames"] = cfg_dict["frames"]  # keep in sync
-    engine = Engine(Config(
-        seed=cfg_dict["seed"],
-        frames=cfg_dict["frames"],
-        space=cfg_dict["space"],
-        n_init=cfg_dict.get("n_init", 9),
-        k_flux=cfg_dict["k_flux"],
-        k_motor=cfg_dict["k_motor"],
-        decay=cfg_dict["decay"],
-        diffuse=cfg_dict["diffuse"],
-        env=FieldCfg(
-            length=cfg_dict["env"]["length"],
+def draw_heatmap_subs(S, upto):
+    # S: (T, X)
+    fig, ax = plt.subplots(figsize=(6.4, 4))
+    ax.imshow(S[:upto].T, aspect="auto", origin="lower",
+              interpolation="nearest")
+    ax.set_title("Substrate S(t, x)")
+    ax.set_xlabel("frame"); ax.set_ylabel("space")
+    subs_img_pl.pyplot(fig)
+    plt.close(fig)
+
+def draw_offset(hist_t, o):
+    fig, ax = plt.subplots(figsize=(6.8, 2.4))
+    ax.plot(hist_t, o, lw=1.2)
+    ax.set_xlabel("frame"); ax.set_ylabel("offset (env idx)")
+    ax.set_title("Boundary offset o(t)")
+    ax.grid(True, alpha=0.3)
+    offset_chart.pyplot(fig)
+    plt.close(fig)
+
+def run_streaming(cfg_dict: Dict[str, Any]):
+    status_box.info("Starting…")
+    engine = Engine(
+        # dataclass wants native types; we pass the plain dict to Engine via Config inside Engine?
+        # Here we call Engine with a constructed dict by reusing sim_core.Config via default_config path,
+        # but Engine’s __init__ accepts Config, not dict—so we use run_sim pattern:
+        # To keep it simple, import Config? Avoid; we can mimic by calling Engine through a tiny wrapper.
+        # Easiest: re-create Engine exactly as run_sim does, but inline:
+        __import__("sim_core").Config(
+            seed=cfg_dict["seed"],
             frames=cfg_dict["frames"],
-            noise_sigma=cfg_dict["env"]["noise_sigma"],
-            sources=cfg_dict["env"]["sources"],
-        ),
-    ))
+            space=cfg_dict["space"],
+            k_flux=cfg_dict["k_flux"],
+            k_motor=cfg_dict["k_motor"],
+            k_noise=cfg_dict["k_noise"],
+            decay=cfg_dict["decay"],
+            diffuse=cfg_dict["diffuse"],
+            band=cfg_dict["band"],
+            env=FieldCfg(
+                length=cfg_dict["env"]["length"],
+                frames=cfg_dict["frames"],
+                noise_sigma=cfg_dict["env"]["noise_sigma"],
+                sources=cfg_dict["env"]["sources"],
+            ),
+        )
+    )  # type: ignore
 
-    if live_mode:
-        last = [0]  # mutable to capture inside callback
+    # Rebuild engine with the Config constructed above
+    from sim_core import Engine as _Engine  # local alias
+    engine = _Engine(engine)  # yes: pass the Config instance we just created
 
-        def cb(t: int):
-            if (t - last[0] >= chunk) or (t == engine.T - 1):
-                last[0] = t
-                redraw(t, engine)
+    T = cfg_dict["frames"]
+    last = [0]
 
-        engine.run(progress_cb=cb)
-        redraw(engine.T - 1, engine)
-    else:
-        engine.run()
-        redraw(engine.T - 1, engine)
+    def progress(t: int):
+        if (t - last[0] >= chunk) or (t == T - 1):
+            last[0] = t
+            status_box.success("Running…")
+            # draw
+            draw_energy(engine.hist.t, engine.hist.E_cell, engine.hist.E_env, engine.hist.E_flux)
+            draw_heatmap_env(engine.env, t + 1)
+            draw_heatmap_subs(engine.S,   t + 1)
+            draw_offset(engine.hist.t, engine.hist.o)
 
-    status.success("Done!")
+    engine.run(progress_cb=progress)
+    status_box.success("Done!")
+
+# Kick off
+if start:
+    run_streaming(cfg_out)
