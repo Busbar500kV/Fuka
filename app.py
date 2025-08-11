@@ -1,37 +1,33 @@
 # app.py
-# Streamlit UI with live streaming plots and JSON-editable sources.
+# Streamlit UI with live streaming plots, JSON-editable sources,
+# and proper placeholder-based pyplot updates (no plot accumulation).
 
-import importlib, inspect, json, textwrap
+import importlib, json
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import streamlit as st
 
-# --- force a clean import, then import stable API names ---
+# --- force clean import, then import stable API names ---
 import sim_core as sc_mod
 importlib.reload(sc_mod)
 from sim_core import Engine, make_engine, default_config
 
-# --- show import diagnostics (so we see what got imported) ---
+st.set_page_config(page_title="Fuka — Free‑Energy Simulation", layout="wide")
+st.title("Fuka — Free‑Energy Gradient Demo (live)")
+
 with st.expander("Import diagnostics", expanded=False):
     st.write("sim_core path:", Path(sc_mod.__file__).as_posix())
     st.code("\n".join(sorted([n for n in dir(sc_mod) if not n.startswith("_")])))
-
-st.set_page_config(page_title="Fuka — Free‑Energy Simulation", layout="wide")
-
-st.title("Fuka — Free‑Energy Gradient Demo (live)")
 
 # -------------------------
 # Sidebar controls
 # -------------------------
 with st.sidebar:
     st.header("Simulation parameters")
-
-    # Keep a dict config in session_state
     if "cfg" not in st.session_state:
         st.session_state.cfg = default_config()
-        # Adjust defaults to match your experiment closely
         st.session_state.cfg.update({
             "frames": 3000,
             "space": 64,
@@ -50,10 +46,8 @@ with st.sidebar:
                 ],
             },
         })
-
     cfg = st.session_state.cfg
 
-    # Top-level knobs
     cfg["seed"]   = int(st.number_input("seed", 0, 10_000, int(cfg.get("seed", 0)), 1))
     cfg["frames"] = int(st.number_input("frames", 100, 50_000, int(cfg.get("frames", 3000)), 100))
     cfg["space"]  = int(st.number_input("space (substrate cells)", 8, 1024, int(cfg.get("space", 64)), 1))
@@ -73,7 +67,7 @@ with st.sidebar:
     env["frames"]      = int(st.number_input("env.frames", 100, 50_000, int(env.get("frames", cfg["frames"])), 100))
     env["noise_sigma"] = float(st.number_input("env.noise_sigma", 0.0, 1.0, float(env.get("noise_sigma", 0.0)), 0.01))
 
-    st.caption("Edit sources JSON below. Example provided in the help box.")
+    st.caption("Edit sources JSON below.")
     default_sources_example = [
         {"kind": "constant_patch", "amp": 1.0, "center": 15, "width": 10},
         # {"kind": "moving_peak", "amp": 0.6, "speed": 0.08, "width": 6.0, "start": 340},
@@ -96,93 +90,107 @@ with st.sidebar:
     chunk     = int(st.number_input("Redraw every N frames", 1, 500, 25, 1))
     go_btn    = st.button("Run simulation", type="primary")
 
-
 # -------------------------
-# Main area placeholders
+# Placeholders
 # -------------------------
 col_top = st.columns([2, 1])
 with col_top[0]:
     st.subheader("Substrate field S(t, x) — last frame")
-    placeholder_img = st.empty()
+    ph_substrate = st.empty()
 
 with col_top[1]:
     st.subheader("Energies")
-    placeholder_chart = st.empty()
-    placeholder_table = st.empty()
+    ph_energies = st.empty()
+    ph_table    = st.empty()
 
 st.subheader("Environment slice vs Substrate (last frame)")
-placeholder_env = st.empty()
+ph_env_vs_subs = st.empty()
+
+st.subheader("Histograms (live)")
+ph_hists = st.empty()
 
 status_box = st.empty()
 
-
 # -------------------------
-# Helpers for plotting
+# Plot helpers (return figs)
 # -------------------------
-def plot_last_frame(S_last: np.ndarray):
+def fig_substrate(S_last: np.ndarray):
     import matplotlib.pyplot as plt
     fig, ax = plt.subplots(figsize=(6, 3))
     ax.plot(S_last, lw=2)
     ax.set_title("Substrate S at last frame")
-    ax.set_xlabel("x")
-    ax.set_ylabel("energy")
-    st.pyplot(fig)
-    plt.close(fig)
+    ax.set_xlabel("x"); ax.set_ylabel("energy")
+    fig.tight_layout()
+    return fig
 
-def plot_env_vs_subs(env_row: np.ndarray, S_last: np.ndarray):
+def fig_env_vs_subs(env_row: np.ndarray, S_last: np.ndarray):
     import matplotlib.pyplot as plt
     fig, ax = plt.subplots(figsize=(6, 3))
     ax.plot(env_row, lw=1, label="env (resampled)")
-    ax.plot(S_last, lw=2, label="substrate")
+    ax.plot(S_last,  lw=2, label="substrate")
     ax.legend()
     ax.set_title("Env row vs Substrate (last frame)")
-    st.pyplot(fig)
-    plt.close(fig)
+    ax.set_xlabel("x"); ax.set_ylabel("energy")
+    fig.tight_layout()
+    return fig
 
-def plot_energies(hist):
+def fig_hists(env_row: np.ndarray, S_last: np.ndarray):
+    import matplotlib.pyplot as plt
+    fig, ax = plt.subplots(figsize=(6, 3))
+    bins = max(10, int(np.sqrt(len(S_last))))
+    ax.hist(S_last, bins=bins, alpha=0.7, label="S_last")
+    ax.hist(env_row, bins=bins, alpha=0.5, label="env_row")
+    ax.legend()
+    ax.set_title("Distributions (S_last vs env_row)")
+    ax.set_xlabel("energy"); ax.set_ylabel("count")
+    fig.tight_layout()
+    return fig
+
+def update_energies(hist):
     df = pd.DataFrame({
         "t": hist.t,
         "E_cell": hist.E_cell,
         "E_env":  hist.E_env,
         "E_flux": hist.E_flux,
-    })
-    df = df.set_index("t")
-    placeholder_chart.line_chart(df)
-
+    }).set_index("t")
+    ph_energies.line_chart(df)
 
 def redraw(engine: Engine, t: int):
-    # last frame data
-    S_last = engine.S[t]
-    env_row = engine.env[min(t, engine.env.shape[0]-1)]
-    # resample env row for overlay plot
+    # data
+    S_last  = engine.S[t]
+    env_raw = engine.env[min(t, engine.env.shape[0]-1)]
+    # resample env row to substrate size for overlays/hists
     if engine.env.shape[1] != engine.X:
         idx = (np.arange(engine.X) * engine.env.shape[1] // engine.X) % engine.env.shape[1]
-        env_row = env_row[idx]
+        env_row = env_raw[idx]
+    else:
+        env_row = env_raw
 
-    placeholder_img.empty()
-    plot_last_frame(S_last)
-    placeholder_env.empty()
-    plot_env_vs_subs(env_row, S_last)
-    plot_energies(engine.hist)
+    # figures
+    fig1 = fig_substrate(S_last)
+    fig2 = fig_env_vs_subs(env_row, S_last)
+    fig3 = fig_hists(env_row, S_last)
 
-    # small info table
-    data = {
+    # render *into* placeholders (no accumulation)
+    ph_substrate.pyplot(fig1, clear_figure=True)
+    ph_env_vs_subs.pyplot(fig2, clear_figure=True)
+    ph_hists.pyplot(fig3, clear_figure=True)
+
+    # energies + small table
+    update_energies(engine.hist)
+    ph_table.dataframe(pd.DataFrame({
         "t": [t],
         "E_cell": [engine.hist.E_cell[-1]],
         "E_env":  [engine.hist.E_env[-1]],
         "E_flux": [engine.hist.E_flux[-1]],
-    }
-    placeholder_table.dataframe(pd.DataFrame(data))
-
+    }))
 
 # -------------------------
-# Run button
+# Run
 # -------------------------
 if go_btn and sources_ok:
-    # Build engine fresh each run
     engine = make_engine(cfg)
 
-    # Streamed or batch run
     if live_mode:
         last = {"t": -1}
         def cb(t):
@@ -198,6 +206,5 @@ if go_btn and sources_ok:
         engine.run()
         redraw(engine, engine.T - 1)
         status_box.success("Done!")
-
 else:
-    st.info("Adjust parameters on the left, then press **Run simulation**.")
+    st.info("Set parameters and press **Run simulation**.")
