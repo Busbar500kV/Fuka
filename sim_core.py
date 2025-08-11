@@ -29,7 +29,7 @@ class Config:
     seed: int = 0
     frames: int = 5000
     space: int = 64
-    n_init: int = 9  # initial generic connections (not used heavily but kept for parity)
+    n_init: int = 9  # kept for parity; not used in this minimal core
     # energy / dynamics knobs
     k_flux: float = 0.05       # how strongly boundary pumps env→cell when gradient exists
     k_motor: float = 2.0       # random motor exploration pump along boundary band
@@ -102,7 +102,7 @@ class Engine:
         self.env = build_env(cfg.env, self.rng)  # shape (T, X_env)
         self.T = cfg.frames
         self.X = cfg.space
-        # substrate state S[t, x] (we keep only current row + for plots we can reconstruct)
+        # substrate state S[t, x]
         self.S = np.zeros((self.T, self.X), dtype=float)
         self.S[0] = 0.0
         # energies (scalars per-step)
@@ -111,10 +111,10 @@ class Engine:
     def step(self, t: int) -> Tuple[float, float, float]:
         """Advance by one step; returns (E_cell, E_env, E_flux) at this t."""
         cfg = self.cfg
-        # env row for this step; if user set space!=env.length, we tile/crop
+
+        # env row for this step; if user set space!=env.length, resample via index mapping
         e_row = self.env[t]
         if self.env.shape[1] != self.X:
-            # simple resample by modulo (keeps periodicity)
             idx = (np.arange(self.X) * self.env.shape[1] // self.X) % self.env.shape[1]
             e_row = e_row[idx]
 
@@ -133,7 +133,7 @@ class Engine:
         pump = np.zeros_like(S_decayed)
         pump[:band] += cfg.k_flux * grad
 
-        # motor exploration along boundary band: small random pushes
+        # motor exploration along boundary band: random pushes
         mot = np.zeros_like(S_decayed)
         mot[:band] += cfg.k_motor * self.rng.random(band)
 
@@ -153,7 +153,7 @@ class Engine:
 
         return E_cell, E_env, E_flux
 
-    # ---- ONLY CHANGE: accept snapshot_every and ignore it; swallow extra kwargs ----
+    # Accept snapshot_every (ignored) to stay compatible with UI
     def run(self, progress_cb: Optional[Callable[[int], None]] = None,
             snapshot_every: Optional[int] = None, **kwargs) -> None:
         for t in range(self.T):
