@@ -18,9 +18,9 @@ class FieldCfg:
     frames: int = 5000         # total frames
     noise_sigma: float = 0.00  # additive Gaussian noise
     # Supported kinds:
-    #  - "constant_uniform": {"kind": "...", "amp": 0.0}
-    #  - "constant_patch":   {"kind": "...", "amp": 1.0, "center": 15, "width": 8}
-    #  - "moving_peak":      {"kind": "...", "amp": 1.0, "speed": 0.10, "width": 4.0, "start": 24}
+    #  - "constant_uniform": {"amp": 0.0}
+    #  - "constant_patch":   {"amp": 1.0, "center": 15, "width": 8}
+    #  - "moving_peak":      {"amp": 1.0, "speed": 0.10, "width": 4.0, "start": 24}
     sources: List[Dict] = field(default_factory=lambda: [
         {"kind": "constant_patch", "amp": 1.0, "center": 15, "width": 10},
     ])
