@@ -1,168 +1,169 @@
-# app.py
-# Live heatmaps for Environment and Substrate + live energy chart.
-# Uses placeholders so figures update in place (no plot stacking).
-
-import importlib, json
-from pathlib import Path
-
+# app.py — Streamlit dashboard (live)
+import json
 import numpy as np
-import pandas as pd
+import matplotlib.pyplot as plt
 import streamlit as st
 
-# clean import then import stable API
-import sim_core as sc_mod
-importlib.reload(sc_mod)
-from sim_core import make_engine, default_config
+from sim_core import make_engine, default_config, Engine
 
-st.set_page_config(page_title="Fuka — Free‑Energy Simulation (Live)", layout="wide")
-st.title("Fuka — Free‑Energy Gradient Simulation (Live)")
+st.set_page_config(page_title="Fuka – Free‑Energy Gradient Simulation (Live)", layout="wide")
 
-with st.expander("Import diagnostics", expanded=False):
-    st.write("sim_core path:", Path(sc_mod.__file__).as_posix())
-    st.code("\n".join(sorted([n for n in dir(sc_mod) if not n.startswith('_')])))
-
-# -------------------------
+# --------------------------
 # Sidebar controls
-# -------------------------
-with st.sidebar:
-    st.header("Controls")
+# --------------------------
+st.sidebar.title("Controls")
 
-    if "cfg" not in st.session_state:
-        st.session_state.cfg = default_config()
-        # defaults close to your experiment
-        st.session_state.cfg.update({
-            "frames": 5000,
-            "space": 64,
-            "k_flux": 0.08,
-            "k_motor": 0.40,
-            "k_noise": 0.02,
-            "decay": 0.01,
-            "diffuse": 0.15,
-            "band": 3,
-            "env": {
-                "length": 512,
-                "frames": 5000,
-                "noise_sigma": 0.0,
-                "sources": [
-                    {"kind": "constant_patch", "amp": 1.0, "center": 15, "width": 10}
-                ],
-            },
-        })
+# Keep a dict in session_state so reruns preserve your settings
+if "cfg" not in st.session_state:
+    st.session_state.cfg = default_config()
+cfg = st.session_state.cfg
 
-    cfg = st.session_state.cfg
-    cfg["seed"]   = int(st.number_input("Seed", 0, 10_000, int(cfg.get("seed", 0)), 1))
-    cfg["frames"] = int(st.number_input("Frames", 100, 50_000, int(cfg.get("frames", 5000)), 100))
-    cfg["space"]  = int(st.number_input("Space (cells)", 8, 1024, int(cfg.get("space", 64)), 1))
+seed    = st.sidebar.number_input("Seed", 0, 10_000, int(cfg["seed"]), step=1)
+frames  = st.sidebar.number_input("Frames", 100, 100_000, int(cfg["frames"]), step=100)
+space   = st.sidebar.number_input("Space (cells)", 8, 1_024, int(cfg["space"]), step=1)
 
-    st.markdown("---")
-    cfg["k_flux"]  = float(st.number_input("k_flux (boundary flux)", 0.0, 5.0, float(cfg.get("k_flux", 0.08)), 0.01))
-    cfg["k_motor"] = float(st.number_input("k_motor (motor explore)", 0.0, 5.0, float(cfg.get("k_motor", 0.40)), 0.01))
-    cfg["k_noise"] = float(st.number_input("k_noise (band noise)", 0.0, 1.0, float(cfg.get("k_noise", 0.02)), 0.01))
-    cfg["decay"]   = float(st.number_input("decay", 0.0, 1.0, float(cfg.get("decay", 0.01)), 0.001))
-    cfg["diffuse"] = float(st.number_input("diffuse", 0.0, 1.0, float(cfg.get("diffuse", 0.15)), 0.001))
-    cfg["band"]    = int(st.number_input("band (boundary width)", 1, 32, int(cfg.get("band", 3)), 1))
+k_flux  = st.sidebar.number_input("k_flux (boundary flux)", 0.0, 10.0, float(cfg.get("k_flux", 0.08)), step=0.01, format="%.3f")
+k_motor = st.sidebar.number_input("k_motor (motor explore)", 0.0, 20.0, float(cfg.get("k_motor", 4.90)), step=0.10, format="%.2f")
+k_noise = st.sidebar.number_input("k_noise (band noise)", 0.0, 2.0, float(cfg.get("k_noise", 0.02)), step=0.01, format="%.2f")
 
-    st.markdown("---")
-    st.subheader("Environment")
-    env = cfg.setdefault("env", {})
-    env["length"]      = int(st.number_input("Env length", 16, 4096, int(env.get("length", 512)), 1))
-    env["frames"]      = int(st.number_input("Env frames", 100, 50_000, int(env.get("frames", cfg["frames"])), 100))
-    env["noise_sigma"] = float(st.number_input("Env noise σ", 0.0, 1.0, float(env.get("noise_sigma", 0.0)), 0.01))
+decay   = st.sidebar.number_input("decay", 0.0, 1.0, float(cfg.get("decay", 0.01)), step=0.005, format="%.3f")
+diffuse = st.sidebar.number_input("diffuse", 0.0, 2.0, float(cfg.get("diffuse", 0.15)), step=0.01, format="%.2f")
+band    = st.sidebar.number_input("band (boundary width)", 1, 32, int(cfg.get("band", 3)), step=1)
 
-    st.caption("Edit env sources JSON:")
-    sources_default = [
-        {"kind": "constant_patch", "amp": 1.0, "center": 15, "width": 10},
-        # {"kind": "moving_peak", "amp": 0.6, "speed": 0.08, "width": 6.0, "start": 340},
-        # {"kind": "constant_uniform", "amp": 0.05},
-    ]
-    raw_sources = st.text_area("env.sources (JSON list)",
-                               value=json.dumps(env.get("sources", sources_default), indent=2),
-                               height=220)
-    try:
-        env["sources"] = json.loads(raw_sources)
-        sources_ok = True
-    except Exception as e:
-        sources_ok = False
-        st.error(f"Invalid JSON: {e}")
+c_motor = st.sidebar.number_input("c_motor (motor work cost)", 0.0, 1.0, float(cfg.get("c_motor", 0.02)), step=0.005, format="%.3f")
 
-    st.markdown("---")
-    live_mode = st.checkbox("Live streaming", value=True)
-    chunk     = int(st.number_input("Refresh chunk (frames)", 1, 500, 25, 1))
-    go        = st.button("Run simulation", type="primary")
+# Environment section
+st.sidebar.subheader("Environment")
+env_len  = st.sidebar.number_input("Env length", 8, 4096, int(cfg["env"]["length"]), step=8)
+env_sig  = st.sidebar.number_input("Env noise σ", 0.0, 1.0, float(cfg["env"]["noise_sigma"]), step=0.01)
 
-# -------------------------
-# Placeholders
-# -------------------------
-col1, col2 = st.columns([1.2, 1])
+st.sidebar.markdown("**Sources JSON (list)**")
+src_str = st.sidebar.text_area(
+    "Edit env sources",
+    value=json.dumps(cfg["env"]["sources"], indent=2),
+    height=220
+)
+sources_ok = True
+try:
+    src_list = json.loads(src_str)
+    assert isinstance(src_list, list)
+    st.sidebar.success("Sources OK")
+except Exception as e:
+    sources_ok = False
+    st.sidebar.error(f"Invalid JSON: {e}")
+    src_list = cfg["env"]["sources"]
+
+live_mode = st.sidebar.checkbox("Live streaming", value=True)
+chunk     = st.sidebar.slider("Refresh chunk (frames)", 10, 500, 120)
+
+# Update session cfg dict
+cfg.update(dict(
+    seed=seed, frames=frames, space=space,
+    k_flux=k_flux, k_motor=k_motor, k_noise=k_noise,
+    decay=decay, diffuse=diffuse, band=band, c_motor=c_motor,
+))
+cfg["env"].update(dict(length=env_len, frames=frames, noise_sigma=env_sig, sources=src_list))
+
+# --------------------------
+# Main layout
+# --------------------------
+st.title("Fuka – Free‑Energy Gradient Simulation (Live)")
+status = st.empty()
+
+# Live line chart for energies
+fig_energy, ax_energy = plt.subplots()
+line_cell, = ax_energy.plot([], [], label="E_cell")
+line_env,  = ax_energy.plot([], [], label="E_env")
+line_flux, = ax_energy.plot([], [], label="E_flux")
+ax_energy.set_title("Energies (live)")
+ax_energy.legend(loc="upper left")
+energy_ph = st.pyplot(fig_energy, clear_figure=False)
+
+# Live heatmaps (environment and substrate)
+col1, col2 = st.columns(2)
 with col1:
-    st.subheader("Environment E(t,x)  •  Substrate S(t,x)")
-    ph_env_heat = st.empty()
-    ph_sub_heat = st.empty()
+    fig_env, ax_env = plt.subplots()
+    env_im = ax_env.imshow(np.zeros((10, 10)), aspect="auto", origin="lower")
+    ax_env.set_title("Environment E(t,x)")
+    ax_env.set_xlabel("frame"); ax_env.set_ylabel("space")
+    env_ph = st.pyplot(fig_env, clear_figure=False)
+
 with col2:
-    st.subheader("Energies (live)")
-    ph_energy = st.empty()
-    ph_status = st.empty()
+    fig_sub, ax_sub = plt.subplots()
+    sub_im = ax_sub.imshow(np.zeros((10, 10)), aspect="auto", origin="lower")
+    ax_sub.set_title("Substrate S(t,x)")
+    ax_sub.set_xlabel("frame"); ax_sub.set_ylabel("space")
+    sub_ph = st.pyplot(fig_sub, clear_figure=False)
 
-# -------------------------
-# Matplotlib helpers
-# -------------------------
-def render_env_heatmap(E: np.ndarray):
-    import matplotlib.pyplot as plt
-    fig, ax = plt.subplots(figsize=(6.8, 3.2))
-    im = ax.imshow(E.T, aspect="auto", origin="lower")
-    ax.set_xlabel("frame"); ax.set_ylabel("space")
-    ax.set_title("Environment E(t,x)")
-    fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-    fig.tight_layout()
-    return fig
+# --------------------------
+# Run button
+# --------------------------
+if st.button("Run / Rerun"):
+    status.info("Starting…")
 
-def render_substrate_heatmap(S_part: np.ndarray):
-    import matplotlib.pyplot as plt
-    fig, ax = plt.subplots(figsize=(6.8, 3.2))
-    im = ax.imshow(S_part.T, aspect="auto", origin="lower")
-    ax.set_xlabel("frame"); ax.set_ylabel("space")
-    ax.set_title("Substrate S(t,x)")
-    fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-    fig.tight_layout()
-    return fig
+    # Build a fresh engine
+    engine: Engine = make_engine(cfg)
 
-def render_energy(hist):
-    df = pd.DataFrame({
-        "t": hist.t,
-        "E_cell": hist.E_cell,
-        "E_env":  hist.E_env,
-        "E_flux": hist.E_flux,
-    }).set_index("t")
-    ph_energy.line_chart(df)
+    # Buffers for live plots
+    t_list, c_list, e_list, f_list = [], [], [], []
 
-# -------------------------
-# Run
-# -------------------------
-if go and sources_ok:
-    engine = make_engine(cfg)
+    # To build heatmaps incrementally we pre-allocate
+    S_live = np.zeros((engine.T, engine.X), dtype=float)
+    # We’ll construct a resampled env heatmap on the fly
+    E_live = np.zeros((engine.T, engine.X), dtype=float)
 
-    # Environment heatmap is static → draw once
-    ph_env_heat.pyplot(render_env_heatmap(engine.env), clear_figure=True)
+    def redraw(t: int):
+        # Update lines
+        line_cell.set_data(t_list, c_list)
+        line_env.set_data(t_list, e_list)
+        line_flux.set_data(t_list, f_list)
+        ax_energy.relim(); ax_energy.autoscale_view()
+        energy_ph.pyplot(fig_energy, clear_figure=False)
+
+        # Update env heatmap (show all rows up to current t)
+        env_im.set_data(E_live[:t+1].T)
+        env_im.set_extent([0, t+1, 0, engine.X])  # frame axis grows
+        fig_env.tight_layout()
+        env_ph.pyplot(fig_env, clear_figure=False)
+
+        # Update substrate heatmap
+        sub_im.set_data(S_live[:t+1].T)
+        sub_im.set_extent([0, t+1, 0, engine.X])
+        fig_sub.tight_layout()
+        sub_ph.pyplot(fig_sub, clear_figure=False)
 
     if live_mode:
-        last = {"t": -1}
-        def cb(t):
-            if t == engine.T - 1 or (t - last["t"]) >= chunk:
-                last["t"] = t
-                # update substrate heatmap with data up to t
-                ph_sub_heat.pyplot(render_substrate_heatmap(engine.S[:t+1]), clear_figure=True)
-                render_energy(engine.hist)
-                ph_status.info(f"Running… frame {t+1}/{engine.T}")
+        last = [-1]  # mutable closure storage
+
+        def cb(t: int):
+            # pull last values recorded by the engine
+            t_list.append(t)
+            c_list.append(engine.hist.E_cell[-1])
+            e_list.append(engine.hist.E_env[-1])
+            f_list.append(engine.hist.E_flux[-1])
+
+            # fill the images
+            S_live[t] = engine.S[t]
+            # env slice resampled used inside engine.step; reconstruct it here too
+            # (call private helper is okay for app convenience)
+            E_live[t] = engine._env_row_resampled(t)  # noqa
+
+            # redraw every chunk or at end
+            if (t - last[0] >= chunk) or (t == engine.T - 1):
+                last[0] = t
+                redraw(t)
 
         engine.run(progress_cb=cb)
-        # final refresh
-        ph_sub_heat.pyplot(render_substrate_heatmap(engine.S), clear_figure=True)
-        render_energy(engine.hist)
-        ph_status.success("Done!")
+        status.success("Done!")
     else:
-        engine.run()
-        ph_sub_heat.pyplot(render_substrate_heatmap(engine.S), clear_figure=True)
-        render_energy(engine.hist)
-        ph_status.success("Done!")
-else:
-    st.info("Set parameters and press **Run simulation**.")
+        engine.run(progress_cb=None)
+        # Fill buffers for a final render
+        t_list = engine.hist.t
+        c_list = engine.hist.E_cell
+        e_list = engine.hist.E_env
+        f_list = engine.hist.E_flux
+        S_live[:, :] = engine.S
+        for t in range(engine.T):
+            E_live[t] = engine._env_row_resampled(t)  # noqa
+        redraw(engine.T - 1)
+        status.success("Done!")
