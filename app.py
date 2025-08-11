@@ -29,16 +29,16 @@ def clamp(v, lo, hi): return int(max(lo, min(hi, v)))
 
 # basic knobs
 cfg["seed"]   = st.sidebar.number_input("Seed", 0, 1_000_000, int(cfg.get("seed", 0)), 1)
-cfg["frames"] = clamp(st.sidebar.number_input("Frames", 200, 5000, int(cfg.get("frames", 1600)), 100), 200, 5000)
+cfg["frames"] = clamp(st.sidebar.number_input("Frames", 10000, 20000, int(cfg.get("frames", 1600)), 100), 200, 20000)
 cfg["space"]  = clamp(st.sidebar.number_input("Space (cells)", 32, 512, int(cfg.get("space", 192)), 16), 32, 512)
 
 # dynamics
 cols = st.sidebar.columns(2)
-cfg["k_flux"]  = float(cols[0].number_input("k_flux", 0.0, 1.0, float(cfg.get("k_flux", 0.05)), 0.01))
-cfg["k_motor"] = float(cols[1].number_input("k_motor", 0.0, 1.0, float(cfg.get("k_motor", 0.02)), 0.01))
+cfg["k_flux"]  = float(cols[0].number_input("k_flux", 0.0, 1.0, float(cfg.get("k_flux", 0.04)), 0.01))
+cfg["k_motor"] = float(cols[1].number_input("k_motor", 0.0, 3.0, float(cfg.get("k_motor", 2.0)), 0.01))
 cols = st.sidebar.columns(2)
-cfg["diffuse"] = float(cols[0].number_input("diffuse", 0.0, 1.0, float(cfg.get("diffuse", 0.15)), 0.01))
-cfg["decay"]   = float(cols[1].number_input("decay", 0.0, 0.5, float(cfg.get("decay", 0.01)), 0.005))
+cfg["diffuse"] = float(cols[0].number_input("diffuse", 0.0, 1.0, float(cfg.get("diffuse", 0.06)), 0.01))
+cfg["decay"]   = float(cols[1].number_input("decay", 0.0, 0.5, float(cfg.get("decay", 0.01)), 0.002))
 
 # environment / sources
 env = cfg.setdefault("env", {})
