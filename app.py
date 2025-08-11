@@ -1,199 +1,203 @@
 # app.py
-# Streamlit UI with live streaming plots for the free-energy simulation.
+# Streamlit UI with live streaming plots and JSON-editable sources.
 
-import json
-import time
-from typing import Dict
+import importlib, inspect, json, textwrap
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
-import plotly.graph_objects as go
 import streamlit as st
 
-from sim_core import make_engine, default_config, Engine
+# --- force a clean import, then import stable API names ---
+import sim_core as sc_mod
+importlib.reload(sc_mod)
+from sim_core import Engine, make_engine, default_config
 
+# --- show import diagnostics (so we see what got imported) ---
+with st.expander("Import diagnostics", expanded=False):
+    st.write("sim_core path:", Path(sc_mod.__file__).as_posix())
+    st.code("\n".join(sorted([n for n in dir(sc_mod) if not n.startswith("_")])))
 
-st.set_page_config(page_title="Fuka: Free‑Energy Live", layout="wide")
+st.set_page_config(page_title="Fuka — Free‑Energy Simulation", layout="wide")
 
-st.title("Fuka — Free‑Energy Gradient Simulation (Live)")
-
-# -------------------------
-# Session state scaffolding
-# -------------------------
-if "cfg" not in st.session_state:
-    st.session_state.cfg = default_config()
-if "engine" not in st.session_state:
-    st.session_state.engine = make_engine(st.session_state.cfg)
-if "run_live" not in st.session_state:
-    st.session_state.run_live = False
-if "last_render_t" not in st.session_state:
-    st.session_state.last_render_t = -1
-
-cfg: Dict = st.session_state.cfg
-engine: Engine = st.session_state.engine
+st.title("Fuka — Free‑Energy Gradient Demo (live)")
 
 # -------------------------
 # Sidebar controls
 # -------------------------
 with st.sidebar:
-    st.subheader("Parameters")
+    st.header("Simulation parameters")
 
-    seed    = st.number_input("seed", 0, 10_000, int(cfg.get("seed", 0)), 1)
-    frames  = st.number_input("frames (timeline budget)", 200, 200_000, int(cfg.get("frames", 5000)), 200)
-    space   = st.number_input("space (substrate cells)", 8, 1024, int(cfg.get("space", 64)), 1)
-    band    = st.number_input("boundary band width", 1, 32, int(cfg.get("band", 3)), 1)
+    # Keep a dict config in session_state
+    if "cfg" not in st.session_state:
+        st.session_state.cfg = default_config()
+        # Adjust defaults to match your experiment closely
+        st.session_state.cfg.update({
+            "frames": 3000,
+            "space": 64,
+            "k_flux": 0.08,
+            "k_motor": 0.40,
+            "k_noise": 0.02,
+            "decay": 0.01,
+            "diffuse": 0.15,
+            "band": 3,
+            "env": {
+                "length": 512,
+                "frames": 3000,
+                "noise_sigma": 0.0,
+                "sources": [
+                    {"kind": "constant_patch", "amp": 1.0, "center": 15, "width": 10}
+                ],
+            },
+        })
 
-    k_flux  = st.number_input("k_flux (env→cell pump)", 0.0, 10.0, float(cfg.get("k_flux", 0.12)), 0.01)
-    k_motor = st.number_input("k_motor (motor pokes)",   0.0, 10.0, float(cfg.get("k_motor", 0.8)), 0.01)
-    diffuse = st.number_input("diffuse",                  0.0, 1.0,  float(cfg.get("diffuse", 0.08)), 0.005)
-    decay   = st.number_input("decay",                    0.0, 1.0,  float(cfg.get("decay", 0.01)), 0.001)
+    cfg = st.session_state.cfg
+
+    # Top-level knobs
+    cfg["seed"]   = int(st.number_input("seed", 0, 10_000, int(cfg.get("seed", 0)), 1))
+    cfg["frames"] = int(st.number_input("frames", 100, 50_000, int(cfg.get("frames", 3000)), 100))
+    cfg["space"]  = int(st.number_input("space (substrate cells)", 8, 1024, int(cfg.get("space", 64)), 1))
 
     st.markdown("---")
-    st.caption("Environment (space-time field)")
-    env_len   = st.number_input("env.length", 8, 4096, int(cfg["env"].get("length", 512)), 1)
-    env_noise = st.number_input("env.noise_sigma", 0.0, 1.0, float(cfg["env"].get("noise_sigma", 0.005)), 0.001)
-    env_frames= st.number_input("env.frames (optional, default=frames)", 0, 200_000,
-                                int(cfg["env"].get("frames", int(frames))), 200)
+    cfg["k_flux"]  = float(st.number_input("k_flux (boundary flux)", 0.0, 5.0, float(cfg.get("k_flux", 0.08)), 0.01))
+    cfg["k_motor"] = float(st.number_input("k_motor (motor explore)", 0.0, 5.0, float(cfg.get("k_motor", 0.40)), 0.01))
+    cfg["k_noise"] = float(st.number_input("k_noise (direct band noise)", 0.0, 1.0, float(cfg.get("k_noise", 0.02)), 0.01))
+    cfg["decay"]   = float(st.number_input("decay", 0.0, 1.0, float(cfg.get("decay", 0.01)), 0.001))
+    cfg["diffuse"] = float(st.number_input("diffuse", 0.0, 1.0, float(cfg.get("diffuse", 0.15)), 0.001))
+    cfg["band"]    = int(st.number_input("band (boundary width)", 1, 32, int(cfg.get("band", 3)), 1))
 
-    st.caption("Env sources JSON (array)")
-    default_sources = cfg["env"].get("sources", [
-        {"kind": "moving_peak", "amp": 2.0, "speed": 0.0, "width": 6.0, "start": 15}
-    ])
-    sources_text = st.text_area(
-        "sources",
-        value=json.dumps(default_sources, indent=2),
-        height=220
+    st.markdown("---")
+    st.subheader("Environment")
+    env = cfg.setdefault("env", {})
+    env["length"]      = int(st.number_input("env.length", 16, 4096, int(env.get("length", 512)), 1))
+    env["frames"]      = int(st.number_input("env.frames", 100, 50_000, int(env.get("frames", cfg["frames"])), 100))
+    env["noise_sigma"] = float(st.number_input("env.noise_sigma", 0.0, 1.0, float(env.get("noise_sigma", 0.0)), 0.01))
+
+    st.caption("Edit sources JSON below. Example provided in the help box.")
+    default_sources_example = [
+        {"kind": "constant_patch", "amp": 1.0, "center": 15, "width": 10},
+        # {"kind": "moving_peak", "amp": 0.6, "speed": 0.08, "width": 6.0, "start": 340},
+        # {"kind": "constant_uniform", "amp": 0.05},
+    ]
+    raw_sources = st.text_area(
+        "env.sources (JSON list)",
+        value=json.dumps(env.get("sources", default_sources_example), indent=2),
+        height=220,
     )
+    try:
+        env["sources"] = json.loads(raw_sources)
+        sources_ok = True
+    except Exception as e:
+        sources_ok = False
+        st.error(f"Invalid JSON for sources: {e}")
 
-    col_btns = st.columns(3)
-    with col_btns[0]:
-        reset_clicked = st.button("🔁 Reset / Build", use_container_width=True)
-    with col_btns[1]:
-        step_clicked = st.button("▶️ Step 100", use_container_width=True)
-    with col_btns[2]:
-        run_clicked = st.toggle("🏃 Run Live", value=st.session_state.run_live)
+    st.markdown("---")
+    live_mode = st.checkbox("Live update while running", value=True)
+    chunk     = int(st.number_input("Redraw every N frames", 1, 500, 25, 1))
+    go_btn    = st.button("Run simulation", type="primary")
 
-# Sync toggle back to session_state
-st.session_state.run_live = run_clicked
-
-# Update cfg from sidebar widgets
-cfg["seed"]   = int(seed)
-cfg["frames"] = int(frames)
-cfg["space"]  = int(space)
-cfg["band"]   = int(band)
-cfg["k_flux"] = float(k_flux)
-cfg["k_motor"]= float(k_motor)
-cfg["diffuse"]= float(diffuse)
-cfg["decay"]  = float(decay)
-
-# Parse sources JSON (safe default on error)
-try:
-    parsed_sources = json.loads(sources_text)
-    if not isinstance(parsed_sources, list):
-        raise ValueError("sources must be a JSON list")
-except Exception as e:
-    st.warning(f"Invalid sources JSON, using default. Error: {e}")
-    parsed_sources = [{"kind": "moving_peak", "amp": 2.0, "speed": 0.0, "width": 6.0, "start": 15}]
-
-cfg["env"]["length"] = int(env_len)
-cfg["env"]["noise_sigma"] = float(env_noise)
-cfg["env"]["frames"] = int(env_frames) if env_frames > 0 else int(frames)
-cfg["env"]["sources"] = parsed_sources
-
-# Rebuild engine if requested
-if reset_clicked:
-    st.session_state.engine = make_engine(cfg)
-    st.session_state.last_render_t = -1
-    engine = st.session_state.engine
-    st.success("Engine rebuilt ✅")
 
 # -------------------------
-# Live plotting placeholders
+# Main area placeholders
 # -------------------------
-ph_top = st.container()
-with ph_top:
-    colA, colB = st.columns([1, 1])
-    with colA:
-        env_ph = st.empty()
-    with colB:
-        sub_ph = st.empty()
+col_top = st.columns([2, 1])
+with col_top[0]:
+    st.subheader("Substrate field S(t, x) — last frame")
+    placeholder_img = st.empty()
 
-ph_bottom = st.container()
-with ph_bottom:
-    curves_ph = st.empty()
+with col_top[1]:
+    st.subheader("Energies")
+    placeholder_chart = st.empty()
+    placeholder_table = st.empty()
+
+st.subheader("Environment slice vs Substrate (last frame)")
+placeholder_env = st.empty()
+
+status_box = st.empty()
+
 
 # -------------------------
-# Render helpers
+# Helpers for plotting
 # -------------------------
+def plot_last_frame(S_last: np.ndarray):
+    import matplotlib.pyplot as plt
+    fig, ax = plt.subplots(figsize=(6, 3))
+    ax.plot(S_last, lw=2)
+    ax.set_title("Substrate S at last frame")
+    ax.set_xlabel("x")
+    ax.set_ylabel("energy")
+    st.pyplot(fig)
+    plt.close(fig)
 
-def plot_env(env_matrix: np.ndarray, t_max: int):
-    # Slice up to t_max (wrap-safe)
-    t_max = max(0, int(t_max))
-    rows = min(t_max + 1, env_matrix.shape[0])
-    data = env_matrix[:rows, :]
-    fig = go.Figure(data=go.Heatmap(z=data, colorscale="Viridis", colorbar=dict(title="env")))
-    fig.update_layout(height=300, margin=dict(l=0, r=0, t=10, b=0), xaxis_title="x", yaxis_title="t")
-    return fig
+def plot_env_vs_subs(env_row: np.ndarray, S_last: np.ndarray):
+    import matplotlib.pyplot as plt
+    fig, ax = plt.subplots(figsize=(6, 3))
+    ax.plot(env_row, lw=1, label="env (resampled)")
+    ax.plot(S_last, lw=2, label="substrate")
+    ax.legend()
+    ax.set_title("Env row vs Substrate (last frame)")
+    st.pyplot(fig)
+    plt.close(fig)
 
-def plot_substrate(S: np.ndarray, t_max: int):
-    rows = min(t_max + 1, S.shape[0])
-    data = S[:rows, :]
-    fig = go.Figure(data=go.Heatmap(z=data, colorscale="Plasma", colorbar=dict(title="substrate")))
-    fig.update_layout(height=300, margin=dict(l=0, r=0, t=10, b=0), xaxis_title="x", yaxis_title="t")
-    return fig
-
-def plot_curves(hist_t, E_cell, E_env, E_flux):
+def plot_energies(hist):
     df = pd.DataFrame({
-        "t": hist_t,
-        "E_cell": E_cell,
-        "E_env": E_env,
-        "E_flux": E_flux
+        "t": hist.t,
+        "E_cell": hist.E_cell,
+        "E_env":  hist.E_env,
+        "E_flux": hist.E_flux,
     })
-    fig = go.Figure()
-    fig.add_scatter(x=df["t"], y=df["E_cell"], name="E_cell")
-    fig.add_scatter(x=df["t"], y=df["E_env"],  name="E_env")
-    fig.add_scatter(x=df["t"], y=df["E_flux"], name="E_flux", line=dict(dash="dot"))
-    fig.update_layout(height=280, margin=dict(l=0, r=0, t=10, b=0), xaxis_title="t")
-    return fig
+    df = df.set_index("t")
+    placeholder_chart.line_chart(df)
 
-def redraw(engine: Engine):
-    t_now = engine.t - 1
-    if t_now < 0:
-        t_now = 0
-    env_fig = plot_env(engine.env, t_now)
-    sub_fig = plot_substrate(engine.S, t_now)
-    env_ph.plotly_chart(env_fig, use_container_width=True)
-    sub_ph.plotly_chart(sub_fig, use_container_width=True)
-    curves_ph.plotly_chart(
-        plot_curves(engine.hist.t, engine.hist.E_cell, engine.hist.E_env, engine.hist.E_flux),
-        use_container_width=True
-    )
-    st.session_state.last_render_t = t_now
 
-# Initial draw (if nothing drawn yet)
-if st.session_state.last_render_t < 0:
-    redraw(engine)
+def redraw(engine: Engine, t: int):
+    # last frame data
+    S_last = engine.S[t]
+    env_row = engine.env[min(t, engine.env.shape[0]-1)]
+    # resample env row for overlay plot
+    if engine.env.shape[1] != engine.X:
+        idx = (np.arange(engine.X) * engine.env.shape[1] // engine.X) % engine.env.shape[1]
+        env_row = env_row[idx]
+
+    placeholder_img.empty()
+    plot_last_frame(S_last)
+    placeholder_env.empty()
+    plot_env_vs_subs(env_row, S_last)
+    plot_energies(engine.hist)
+
+    # small info table
+    data = {
+        "t": [t],
+        "E_cell": [engine.hist.E_cell[-1]],
+        "E_env":  [engine.hist.E_env[-1]],
+        "E_flux": [engine.hist.E_flux[-1]],
+    }
+    placeholder_table.dataframe(pd.DataFrame(data))
+
 
 # -------------------------
-# Live / Step controls
+# Run button
 # -------------------------
+if go_btn and sources_ok:
+    # Build engine fresh each run
+    engine = make_engine(cfg)
 
-# Step 100 frames on demand
-if step_clicked:
-    engine.run_chunk(100)
-    redraw(engine)
+    # Streamed or batch run
+    if live_mode:
+        last = {"t": -1}
+        def cb(t):
+            if t == engine.T - 1 or (t - last["t"]) >= chunk:
+                last["t"] = t
+                status_box.info(f"Running… frame {t+1}/{engine.T}")
+                redraw(engine, t)
 
-# Continuous live run (stream)
-if st.session_state.run_live:
-    # Run in small batches so UI stays responsive
-    batch = 20
-    # Keep loop short; the script has to finish for Streamlit to process events.
-    # We simulate "continuous" by doing a few batches per run and letting the
-    # script rerun when the toggle is still on.
-    for _ in range(10):
-        engine.run_chunk(batch)
-        redraw(engine)
-        time.sleep(0.05)
+        engine.run(progress_cb=cb)
+        redraw(engine, engine.T - 1)
+        status_box.success("Done!")
+    else:
+        engine.run()
+        redraw(engine, engine.T - 1)
+        status_box.success("Done!")
 
-    # If you really want a harder continuous mode, increase range() above,
-    # but keep in mind Streamlit must yield control back periodically.
+else:
+    st.info("Adjust parameters on the left, then press **Run simulation**.")
