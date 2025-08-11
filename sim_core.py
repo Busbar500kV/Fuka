@@ -14,8 +14,8 @@ import numpy as np
 @dataclass
 class FieldCfg:
     """Environment field (space-time) configuration."""
-    length: int = 192
-    frames: int = 1600
+    length: int = 512
+    frames: int = 10000
     noise_sigma: float = 0.01
     # Each source: {"kind": "moving_peak", "amp": float, "speed": float, "width": float, "start": int}
     sources: List[Dict] = field(default_factory=lambda: [
@@ -27,14 +27,14 @@ class FieldCfg:
 @dataclass
 class Config:
     seed: int = 0
-    frames: int = 1600
-    space: int = 192
+    frames: int = 5000
+    space: int = 64
     n_init: int = 9  # initial generic connections (not used heavily but kept for parity)
     # energy / dynamics knobs
     k_flux: float = 0.05       # how strongly boundary pumps env→cell when gradient exists
-    k_motor: float = 0.02      # random motor exploration pump along boundary band
+    k_motor: float = 2.0      # random motor exploration pump along boundary band
     decay: float = 0.01        # substrate local decay
-    diffuse: float = 0.15      # substrate diffusion strength
+    diffuse: float = 0.05      # substrate diffusion strength
     env: FieldCfg = field(default_factory=FieldCfg)
 
 
