@@ -1,5 +1,5 @@
 # app.py
-# Streamlit UI with live updates and a combined zoomable Env+Substrate heatmap.
+# Streamlit UI with live combined heatmap and live energy & kernel plots.
 
 import json
 import numpy as np
@@ -8,13 +8,10 @@ import streamlit as st
 
 from sim_core import Engine, default_config, make_config_from_dict
 
-
 st.set_page_config(page_title="Fuka: Free‑Energy Simulation", layout="wide")
 
 
-# -------------------------
-# UI helpers
-# -------------------------
+# ============= UI helpers =============
 
 def to_sources_json(sources_obj) -> str:
     try:
@@ -62,7 +59,6 @@ def draw_kernel(w, ph):
     if w is None or len(w) == 0:
         ph.info("Kernel disabled.")
         return
-    # heatmap of kernel weights (1 x K) for readability
     z = np.array([w], dtype=float)
     fig = go.Figure(data=go.Heatmap(
         z=z, colorscale="Viridis", showscale=True, zmin=-1.0, zmax=1.0,
@@ -75,37 +71,25 @@ def draw_kernel(w, ph):
 
 
 def draw_combined_heatmap(ph, env_full, S_full, t_now, window):
-    """
-    Single, zoomable, combined heatmap:
-      - bottom layer: Environment (last `window` frames)
-      - top layer: Substrate (same window), semi-transparent
-    """
     T_full = env_full.shape[0]
     x = np.arange(S_full.shape[1], dtype=int)
+    t0 = max(0, int(t_now) - int(window) + 1)
+    E = env_full[t0:int(t_now)+1, :]
+    S = S_full[t0:int(t_now)+1, :]
 
-    t0 = max(0, t_now - window + 1)
-    E = env_full[t0:t_now+1, :]
-    S = S_full[t0:t_now+1, :]
-
-    # Normalize to [0,1] each (so overlay is interpretable)
     def norm01(A):
-        d = float(np.nanmax(A) - np.nanmin(A))
-        return (A - np.nanmin(A)) / (d + 1e-12)
+        return (A - np.nanmin(A)) / (np.nanmax(A) - np.nanmin(A) + 1e-12)
 
-    # Resample env to substrate width if needed
     X_sub = S.shape[1]
     X_env = E.shape[1]
     if X_env != X_sub:
-        # nearest resample by modular mapping
         idx = (np.arange(X_sub) * X_env // X_sub) % X_env
         E = E[:, idx]
 
     En = norm01(E)
     Sn = norm01(S)
+    y = np.arange(t0, int(t_now)+1, dtype=int)
 
-    y = np.arange(t0, t_now+1, dtype=int)
-
-    # two heatmap layers in one figure
     fig = go.Figure()
     fig.add_trace(go.Heatmap(
         z=En, x=x, y=y, name="Env",
@@ -116,14 +100,12 @@ def draw_combined_heatmap(ph, env_full, S_full, t_now, window):
         colorscale="Oranges", showscale=False, zmin=0, zmax=1, opacity=0.55
     ))
     fig.update_xaxes(title="space (cells)")
-    fig.update_yaxes(title="frame", autorange="reversed")  # most recent at bottom visually
+    fig.update_yaxes(title="frame", autorange="reversed")
     make_dark(fig, "Combined Env + Substrate (live, zoomable)")
     ph.plotly_chart(fig, use_container_width=True)
 
 
-# -------------------------
-# Sidebar controls
-# -------------------------
+# ============= Sidebar =============
 
 if "cfg" not in st.session_state:
     st.session_state.cfg = default_config()
@@ -141,11 +123,15 @@ with st.sidebar:
     env_noise= st.number_input("env.noise_sigma", 0.0, 1.0, value=float(st.session_state.cfg.get("env", {}).get("noise_sigma", 0.0)), step=0.01, format="%.2f")
     env_base = st.number_input("env.baseline", -5.0, 5.0, value=float(st.session_state.cfg.get("env", {}).get("baseline", 0.0)), step=0.1, format="%.2f")
     env_scale= st.number_input("env.amp_scale", 0.0, 10.0, value=float(st.session_state.cfg.get("env", {}).get("amp_scale", 1.0)), step=0.1, format="%.1f")
-    st.caption("Sources JSON (list of objects). Example: "
+    st.caption("Sources JSON (list). Example:\n"
                '[{"kind":"moving_peak","amp":1.0,"speed":0.0,"width":5.0,"start":15}]')
-    src_text = st.text_area("env.sources (JSON)", value=to_sources_json(st.session_state.cfg.get("env", {}).get("sources", [
-        {"kind": "moving_peak", "amp": 1.0, "speed": 0.0, "width": 5.0, "start": 15}
-    ])), height=140)
+    src_text = st.text_area(
+        "env.sources (JSON)",
+        value=to_sources_json(st.session_state.cfg.get("env", {}).get("sources", [
+            {"kind": "moving_peak", "amp": 1.0, "speed": 0.0, "width": 5.0, "start": 15}
+        ])),
+        height=140
+    )
 
     st.divider()
     st.subheader("Boundary & Motors")
@@ -176,24 +162,19 @@ with st.sidebar:
 run_btn = st.button("Run / Restart", use_container_width=True)
 
 
-# -------------------------
-# Main area placeholders
-# -------------------------
+# ============= Main area =============
 
 col1, col2 = st.columns([2, 1], gap="large")
 with col1:
-    combo_ph = st.empty()     # combined heatmap
-    energy_ph = st.empty()    # energy plot
+    combo_ph = st.empty()
+    energy_ph = st.empty()
 with col2:
-    kernel_ph = st.empty()    # kernel heatmap
+    kernel_ph = st.empty()
     diag = st.container()
 
-# -------------------------
-# Build config dict from UI
-# -------------------------
 
 def build_user_cfg_dict():
-    cfg = dict(
+    return dict(
         seed=seed,
         frames=frames,
         space=space,
@@ -222,18 +203,12 @@ def build_user_cfg_dict():
             k_gate=k_gate,
         ),
     )
-    return cfg
 
-
-# -------------------------
-# Live runner
-# -------------------------
 
 def run_live():
     user_cfg = build_user_cfg_dict()
     engine = Engine(make_config_from_dict(user_cfg))
 
-    # Live loop with updates every `chunk` frames
     last_draw = -1
 
     def redraw(t):
@@ -248,13 +223,12 @@ def run_live():
             redraw(t)
 
     engine.run(progress_cb=cb, snapshot_every=int(chunk))
-    # final paint (in case last chunk didn't hit)
     redraw(engine.T - 1)
 
     with diag:
         st.caption(f"Done. frames={engine.T}, space={engine.X}, env.length={engine.env.shape[1]}  |  boundary offset={engine.offset:.2f}")
         st.progress(1.0)
 
-# kickoff
+
 if run_btn:
     run_live()
