@@ -1,154 +1,222 @@
-# app.py
+# app.py — Streamlit UI for live Fuka simulation
+# Assumes sim_core.py exports: Engine, Config, FieldCfg, default_config
+
 import json
-from typing import Dict, Any
+import time
+from typing import Dict
 
 import numpy as np
-import streamlit as st
-import matplotlib.pyplot as plt
-plt.style.use("dark_background")
-
 import plotly.graph_objects as go
+import streamlit as st
 
-from sim_core import Engine, Config, FieldCfg
+# ---- import from your core ----
+from sim_core import Engine, Config, FieldCfg, default_config
+
+
+st.set_page_config(page_title="Fuka: Free‑Energy Simulation", layout="wide")
 
 # ---------- helpers ----------
 
-def build_engine_from_dict(cfg: Dict[str, Any]) -> Engine:
-    # sources JSON
-    raw = cfg.get("sources_json", "").strip()
-    if raw:
+def build_engine_from_dict(cfg: Dict) -> Engine:
+    """Translate a plain dict (from UI) into an Engine."""
+    env_cfg = cfg.get("env", {})
+    # parse sources (JSON text box may pass a string)
+    src = env_cfg.get("sources", FieldCfg().sources)
+    if isinstance(src, str):
         try:
-            sources = json.loads(raw)
-            if not isinstance(sources, list):
-                raise ValueError("Sources JSON must be a list.")
-        except Exception as e:
-            st.error(f"Invalid Sources JSON: {e}")
-            sources = FieldCfg().sources
-    else:
-        sources = FieldCfg().sources
+            src = json.loads(src)
+        except Exception:
+            src = FieldCfg().sources
 
     fcfg = FieldCfg(
-        length=int(cfg.get("env_length", 512)),
-        frames=int(cfg.get("frames", 5000)),
-        noise_sigma=float(cfg.get("env_noise", 0.01)),
-        sources=sources,
+        length=int(env_cfg.get("length", 512)),
+        frames=int(env_cfg.get("frames", cfg.get("frames", 5000))),
+        noise_sigma=float(env_cfg.get("noise_sigma", 0.01)),
+        sources=src,
     )
     ecfg = Config(
         seed=int(cfg.get("seed", 0)),
         frames=int(cfg.get("frames", 5000)),
         space=int(cfg.get("space", 64)),
+        n_init=int(cfg.get("n_init", 9)),
         k_flux=float(cfg.get("k_flux", 0.05)),
         k_motor=float(cfg.get("k_motor", 2.0)),
         decay=float(cfg.get("decay", 0.01)),
-        diffuse=float(cfg.get("diffuse", 0.15)),
+        diffuse=float(cfg.get("diffuse", 0.05)),
         env=fcfg,
     )
     return Engine(ecfg)
 
-def energy_fig(hist):
-    fig, ax = plt.subplots(figsize=(6.5, 2.8), dpi=120)
-    ax.plot(hist.t, hist.E_cell, label="E_cell")
-    ax.plot(hist.t, hist.E_env,  label="E_env")
-    ax.plot(hist.t, hist.E_flux, label="E_flux")
-    ax.set_title("Energies (live)"); ax.set_xlabel("frame"); ax.legend(loc="upper left")
-    ax.grid(True, alpha=0.3)
-    return fig
 
-def draw_combined_overlay(ph, env, S):
-    # transpose to (space, frame)
-    E = env.T; M = S.T
-    # normalize separately
-    En = (E - E.min()) / (E.ptp() + 1e-12)
-    Mn = (M - M.min()) / (M.ptp() + 1e-12)
+def normalize_01(A: np.ndarray):
+    a_min, a_max = float(np.min(A)), float(np.max(A))
+    den = (a_max - a_min) if (a_max > a_min) else 1.0
+    return (A - a_min) / den
+
+
+def draw_energy(ph, hist):
+    t = np.asarray(hist.t, dtype=float)
+    if t.size == 0:
+        with ph:
+            st.empty()
+        return
+
     fig = go.Figure()
-    fig.add_trace(go.Heatmap(z=Mn, colorscale="Inferno", showscale=True, opacity=0.72,
-                             colorbar=dict(title="S", x=1.02)))
-    fig.add_trace(go.Heatmap(z=En, colorscale="Viridis", showscale=True, opacity=0.55,
-                             colorbar=dict(title="E", x=1.08)))
-    fig.update_layout(template="plotly_dark", title="Combined: Env + Substrate (zoomable)",
-                      xaxis_title="frame", yaxis_title="space",
-                      margin=dict(l=40, r=90, t=40, b=40), height=420)
+    fig.add_trace(go.Scatter(x=t, y=hist.E_env,  name="E_env",  mode="lines"))
+    fig.add_trace(go.Scatter(x=t, y=hist.E_cell, name="E_cell", mode="lines"))
+    fig.add_trace(go.Scatter(x=t, y=hist.E_flux, name="E_flux", mode="lines"))
+    fig.update_layout(template="plotly_dark",
+                      title="Energies over time",
+                      xaxis_title="frame", yaxis_title="energy",
+                      height=300, margin=dict(l=40, r=20, t=40, b=40),
+                      legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1.0))
     with ph:
         st.plotly_chart(fig, use_container_width=True, theme=None)
 
-# ---------- UI ----------
 
-st.set_page_config(page_title="Fuka – Free‑Energy Gradient Simulation (Live)",
-                   layout="wide", page_icon="🧪")
-st.title("Fuka – Free‑Energy Gradient Simulation (Live)")
-
-with st.sidebar:
-    st.subheader("Controls")
-    seed   = st.number_input("Seed",   0, 10_000, value=0, step=1)
-    frames = st.number_input("Frames", 100, 50_000, value=5000, step=100)
-    space  = st.number_input("Space (cells)", 16, 512, value=64, step=1)
-
-    k_flux  = st.number_input("k_flux (boundary flux)", 0.0, 2.0, value=0.05, step=0.01)
-    k_motor = st.number_input("k_motor (motor explore)", 0.0, 5.0, value=2.0,  step=0.10)
-    decay   = st.number_input("decay",   0.0, 0.5, value=0.01, step=0.001)
-    diffuse = st.number_input("diffuse", 0.0, 1.0, value=0.15, step=0.01)
-
-    st.markdown("---")
-    env_length = st.number_input("Env length", 32, 2048, value=512, step=1)
-    env_noise  = st.number_input("Env noise σ", 0.0, 1.0, value=0.01, step=0.01)
-
-    st.caption("Sources JSON (list). Example:\n"
-               "`[{\"kind\":\"moving_peak\",\"amp\":1.0,\"speed\":0.0,\"width\":5,\"start\":340}]`")
-    sources_json = st.text_area("Sources JSON", height=120, value=json.dumps([
-        {"kind": "moving_peak", "amp": 1.0, "speed": 0.0,  "width": 5.0, "start": 340}
-    ], indent=2))
-
-    st.markdown("---")
-    live  = st.checkbox("Live streaming", value=True)
-    chunk = st.slider("Refresh chunk (frames)", 10, 400, 150, step=10)
-
-    run_btn = st.button("Run / Rerun", use_container_width=True)
-
-status_ph = st.empty()
-energy_ph = st.empty()
-combo_ph  = st.empty()
-
-cfg: Dict[str, Any] = dict(
-    seed=seed, frames=frames, space=space,
-    k_flux=k_flux, k_motor=k_motor, decay=decay, diffuse=diffuse,
-    env_length=env_length, env_noise=env_noise, sources_json=sources_json
-)
-
-def run():
-    engine = build_engine_from_dict(cfg)
-
-    # initial draw
-    energy_ph.pyplot(energy_fig(engine.hist), clear_figure=True, use_container_width=True)
-    draw_combined_overlay(combo_ph, engine.env, engine.S)
-
-    if not live:
-        engine.run(progress_cb=lambda _t: None)
-        energy_ph.pyplot(energy_fig(engine.hist), clear_figure=True, use_container_width=True)
-        draw_combined_overlay(combo_ph, engine.env, engine.S)
-        status_ph.success("Done!")
+def draw_combined_heatmap(ph, env: np.ndarray, S: np.ndarray):
+    """Single zoomable plot combining Env and Substrate as two semi-transparent heatmaps."""
+    if env is None or S is None or env.size == 0 or S.size == 0:
+        with ph:
+            st.empty()
         return
 
-    status_ph.info("Starting…")
-    last = -10_000
+    # We want axes: x=frame, y=space. Our arrays are (T, X) so transpose to (X, T).
+    E = np.asarray(env).T
+    M = np.asarray(S).T
+
+    En = normalize_01(E)
+    Mn = normalize_01(M)
+
+    fig = go.Figure()
+    # Substrate first (so env overlays a bit)
+    fig.add_trace(go.Heatmap(
+        z=Mn, colorscale="Inferno", showscale=True, opacity=0.70,
+        colorbar=dict(title="Substrate S", x=1.02)))
+    # Environment over it
+    fig.add_trace(go.Heatmap(
+        z=En, colorscale="Viridis", showscale=True, opacity=0.55,
+        colorbar=dict(title="Environment E", x=1.10)))
+
+    fig.update_layout(
+        template="plotly_dark",
+        title="Combined (zoomable): Environment + Substrate",
+        xaxis_title="frame",
+        yaxis_title="space",
+        height=420,
+        margin=dict(l=40, r=120, t=40, b=40)
+    )
+
+    with ph:
+        st.plotly_chart(fig, use_container_width=True, theme=None)
+
+
+# ---------- UI: sidebar knobs ----------
+if "cfg" not in st.session_state:
+    st.session_state.cfg = default_config()  # plain dict from your core
+
+cfg = st.session_state.cfg
+
+with st.sidebar:
+    st.markdown("## Run Controls")
+
+    # core timing / sizes
+    frames = st.number_input("Frames", min_value=200, max_value=20000, value=int(cfg.get("frames", 5000)), step=200)
+    space  = st.number_input("Substrate size (space)", min_value=32, max_value=1024, value=int(cfg.get("space", 64)), step=32)
+    seed   = st.number_input("Seed", min_value=0, max_value=10_000, value=int(cfg.get("seed", 0)), step=1)
+
+    st.markdown("### Physics")
+    k_flux  = st.slider("k_flux (boundary pump)", 0.0, 1.0, float(cfg.get("k_flux", 0.05)), 0.01)
+    k_motor = st.slider("k_motor (random motor at boundary)", 0.0, 5.0, float(cfg.get("k_motor", 2.0)), 0.05)
+    decay   = st.slider("decay (local loss)", 0.0, 0.2, float(cfg.get("decay", 0.01)), 0.005)
+    diffuse = st.slider("diffuse (local mixing)", 0.0, 0.5, float(cfg.get("diffuse", 0.05)), 0.01)
+
+    st.markdown("### Environment")
+    env_len   = st.number_input("env.length", min_value=64, max_value=4096, value=int(cfg.get("env", {}).get("length", 512)), step=64)
+    env_noise = st.slider("env.noise_sigma", 0.0, 0.5, float(cfg.get("env", {}).get("noise_sigma", 0.01)), 0.01)
+
+    st.caption("Edit sources JSON (moving peaks). Example:\n"
+               """[{"kind":"moving_peak","amp":1.0,"speed":0.10,"width":4.0,"start":24}]""")
+    sources_text = st.text_area(
+        "env.sources (JSON list)",
+        value=json.dumps(cfg.get("env", {}).get("sources", FieldCfg().sources), indent=2),
+        height=180
+    )
+
+    st.markdown("### Live update")
+    chunk = st.slider("UI update chunk (frames)", 20, 500, 150, 10)
+
+    run_btn = st.button("Run", type="primary")
+    stop_btn = st.button("Stop")
+
+
+# ---------- placeholders (single instances, repeatedly updated) ----------
+col_top = st.columns([1, 1])
+energy_ph = col_top[0].empty()
+combo_ph  = col_top[1].empty()
+
+log_ph = st.expander("Run log", expanded=False)
+log_box = log_ph.empty()
+
+# simple stop flag
+if "stop" not in st.session_state:
+    st.session_state.stop = False
+
+if stop_btn:
+    st.session_state.stop = True
+
+def run():
+    # capture user config back into dict
+    cfg["frames"] = int(frames)
+    cfg["space"]  = int(space)
+    cfg["seed"]   = int(seed)
+    cfg["k_flux"]  = float(k_flux)
+    cfg["k_motor"] = float(k_motor)
+    cfg["decay"]   = float(decay)
+    cfg["diffuse"] = float(diffuse)
+    cfg.setdefault("env", {})
+    cfg["env"]["length"]      = int(env_len)
+    cfg["env"]["frames"]      = int(frames)   # tie env frames to sim frames
+    cfg["env"]["noise_sigma"] = float(env_noise)
+    cfg["env"]["sources"]     = sources_text  # keep as text; builder will parse
+
+    engine = build_engine_from_dict(cfg)
+
+    # live run with callbacks
+    st.session_state.stop = False
+    last_update = -1
 
     def cb(t: int):
-        nonlocal last
-        # live energy every step
-        energy_ph.pyplot(energy_fig(engine.hist), clear_figure=True, use_container_width=True)
-        # combined heatmap every chunk
-        if t - last >= int(chunk) or t == engine.cfg.frames - 1:
-            last = t
-            draw_combined_overlay(combo_ph, engine.env, engine.S)
-            status_ph.info(f"Running… t={t+1}/{engine.cfg.frames}")
+        nonlocal last_update
+        # update UI every chunk frames or at the end
+        if (t - last_update) >= chunk or (t == engine.T - 1):
+            last_update = t
+            # update charts
+            draw_energy(energy_ph, engine.hist)
+            draw_combined_heatmap(combo_ph, engine.env[:t+1], engine.S[:t+1])
+            # log
+            log_box.write(f"t={t} / {engine.T-1} | E_cell={engine.hist.E_cell[-1]:.4f} | E_flux={engine.hist.E_flux[-1]:.4f}")
+            # let Streamlit breathe
+            time.sleep(0.001)
+        # allow user stop
+        if st.session_state.stop:
+            raise RuntimeError("Stopped by user")
 
     try:
         engine.run(progress_cb=cb)
-    except TypeError:
-        engine.run(progress_cb=cb)
+        # final refresh
+        draw_energy(energy_ph, engine.hist)
+        draw_combined_heatmap(combo_ph, engine.env, engine.S)
+        log_box.write("Done.")
+    except RuntimeError as ex:
+        if "Stopped by user" in str(ex):
+            log_box.write("Stopped.")
+        else:
+            raise
 
-    energy_ph.pyplot(energy_fig(engine.hist), clear_figure=True, use_container_width=True)
-    draw_combined_overlay(combo_ph, engine.env, engine.S)
-    status_ph.success("Done!")
-
+# kick off
 if run_btn:
     run()
+else:
+    # initial empty renders (optional)
+    pass
