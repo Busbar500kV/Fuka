@@ -1,143 +1,191 @@
 # app.py
+# Streamlit UI — live simulation with energy chart, env/substrate heatmaps,
+# combined view (stacked/overlay), and kernel panel.
 import json
+import math
 import numpy as np
-import plotly.graph_objects as go
 import streamlit as st
+import matplotlib.pyplot as plt
 
-# only import symbols that exist
-from sim_core import default_config, make_engine
+from sim_core import make_engine, default_config, Engine
 
-st.set_page_config(page_title="Fuka — Free‑Energy Gradient Playground", layout="wide")
-st.title("Fuka — Free‑Energy Gradient Playground")
 
-# ---------- helpers ----------
-def plot_env_substrate(env_row: np.ndarray, subs_row: np.ndarray):
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(y=env_row, name="Env (row t)", mode="lines"))
-    fig.add_trace(go.Scatter(y=subs_row, name="Substrate S (row t)", mode="lines"))
-    fig.update_layout(height=260, margin=dict(l=10, r=10, t=30, b=10))
-    return fig
+st.set_page_config(page_title="Fuka — Free‑Energy Gradient (Live)", layout="wide")
 
-def plot_energy(t_hist, cell_hist, env_hist, flux_hist):
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(x=t_hist, y=cell_hist, name="E_cell", mode="lines"))
-    fig.add_trace(go.Scatter(x=t_hist, y=env_hist,  name="E_env",  mode="lines"))
-    fig.add_trace(go.Scatter(x=t_hist, y=flux_hist, name="E_flux", mode="lines"))
-    fig.update_layout(height=260, margin=dict(l=10, r=10, t=30, b=10))
-    return fig
+# ---------------- UI helpers ----------------
 
-# ---------- sidebar: SAME knobs as before ----------
+def clamp(v, lo, hi):
+    return max(lo, min(hi, v))
+
+def draw_energy(hist_placeholder, hist):
+    with hist_placeholder:
+        fig, ax = plt.subplots(figsize=(6.5, 3.2))
+        ax.plot(hist.t, hist.E_cell, label="E_cell")
+        ax.plot(hist.t, hist.E_env,  label="E_env")
+        ax.plot(hist.t, hist.E_flux, label="E_flux")
+        ax.set_title("Energies (live)")
+        ax.legend(loc="upper left")
+        ax.set_xlabel("frame")
+        st.pyplot(fig, clear_figure=True)
+
+def draw_heatmaps(env_ph, subs_ph, env, S):
+    with env_ph:
+        fig, ax = plt.subplots(figsize=(6.5, 3.2))
+        im = ax.imshow(env.T, origin="lower", aspect="auto", cmap="viridis")
+        ax.set_title("Environment E(t,x)")
+        ax.set_xlabel("frame"); ax.set_ylabel("space")
+        fig.colorbar(im, ax=ax)
+        st.pyplot(fig, clear_figure=True)
+    with subs_ph:
+        fig, ax = plt.subplots(figsize=(6.5, 3.2))
+        im = ax.imshow(S.T, origin="lower", aspect="auto", cmap="viridis")
+        ax.set_title("Substrate S(t,x)")
+        ax.set_xlabel("frame"); ax.set_ylabel("space")
+        fig.colorbar(im, ax=ax)
+        st.pyplot(fig, clear_figure=True)
+
+def draw_combined(combo_ph, env, S, mode="stacked", alpha=0.35):
+    with combo_ph:
+        if mode == "overlay":
+            # rescale both to [0,1] for a meaningful overlay
+            e = env.copy()
+            s = S.copy()
+            e = (e - e.min()) / (e.ptp() + 1e-12)
+            s = (s - s.min()) / (s.ptp() + 1e-12)
+            rgb = np.zeros((e.shape[0], e.shape[1], 3), dtype=float)
+            # env in green, substrate in red
+            rgb[:, :, 1] = e
+            rgb[:, :, 0] = s
+            fig, ax = plt.subplots(figsize=(7.0, 3.2))
+            ax.imshow(rgb.transpose(1,0,2), origin="lower", aspect="auto")
+            ax.set_title("Combined view (overlay: red=S, green=E)")
+            ax.set_xlabel("frame"); ax.set_ylabel("space")
+            st.pyplot(fig, clear_figure=True)
+        else:
+            # stacked
+            fig, axs = plt.subplots(2, 1, figsize=(7.0, 6.4), sharex=True)
+            im0 = axs[0].imshow(env.T, origin="lower", aspect="auto", cmap="viridis")
+            axs[0].set_title("Environment E(t,x)")
+            axs[0].set_ylabel("space"); fig.colorbar(im0, ax=axs[0])
+            im1 = axs[1].imshow(S.T, origin="lower", aspect="auto", cmap="viridis")
+            axs[1].set_title("Substrate S(t,x)")
+            axs[1].set_xlabel("frame"); axs[1].set_ylabel("space"); fig.colorbar(im1, ax=axs[1])
+            st.pyplot(fig, clear_figure=True)
+
+def draw_kernels(kph, engine: Engine, max_show=6):
+    with kph:
+        fig, ax = plt.subplots(figsize=(6.5, 3.0))
+        K = engine.K
+        shown = min(max_show, len(engine.w))
+        if shown == 0:
+            ax.text(0.5, 0.5, "no kernels yet", ha="center", va="center")
+        else:
+            for i in range(shown):
+                wi = engine.w[i]
+                ax.plot(np.arange(-K, K+1), wi, alpha=0.8)
+        ax.set_title("Gate kernels (sample)")
+        ax.set_xlabel("offset")
+        ax.set_ylabel("weight")
+        st.pyplot(fig, clear_figure=True)
+
+
+# ---------------- Sidebar controls ----------------
+
+cfg = default_config()
 with st.sidebar:
-    st.header("Parameters")
+    st.title("Controls")
 
-    cfg = default_config()
-    # defaults matching your last good run
-    cfg["space"]  = 64
-    cfg["frames"] = 2000
-    cfg["k_flux"] = 0.08
-    cfg["k_motor"]= 1.5
-    cfg["diffuse"]= 0.08
-    cfg["decay"]  = 0.01
-    cfg["env"]["length"] = 512
-    cfg["env"]["frames"] = cfg["frames"]
-    cfg["env"]["noise_sigma"] = 0.005
-    cfg["env"]["sources"] = [
-        {"kind": "moving_peak", "amp": 1.2, "speed": 0.02, "width": 6.0, "start": 20}
-    ]
+    seed   = st.number_input("Seed", 0, 10000, value=int(cfg["seed"]))
+    frames = st.number_input("Frames", 100, 50000, value=int(cfg["frames"]), step=500)
+    space  = st.number_input("Space (cells)", 16, 512, value=int(cfg["space"]))
+    band   = st.number_input("band (boundary width)", 1, 8, value=int(cfg["band"]))
 
-    seed     = st.number_input("seed",   0, 10_000, value=int(cfg["seed"]), step=1)
-    frames   = st.number_input("frames", 200, 50_000, value=int(cfg["frames"]), step=200)
-    space    = st.number_input("space",   8, 1024,   value=int(cfg["space"]),  step=8)
+    k_flux  = st.number_input("k_flux (boundary flux)", 0.0, 2.0, value=float(cfg["k_flux"]),  step=0.01)
+    k_motor = st.number_input("k_motor (motor explore)", 0.0, 10.0, value=float(cfg["k_motor"]), step=0.01)
+    motor_noise = st.number_input("motor_noise", 0.0, 1.0, value=float(cfg["motor_noise"]), step=0.01)
+    c_motor = st.number_input("c_motor (motor work cost)", 0.0, 5.0, value=float(cfg["c_motor"]), step=0.01)
+    alpha_move = st.number_input("alpha_move (motion gain)", 0.0, 2.0, value=float(cfg["alpha_move"]), step=0.01)
+    beta_tension = st.number_input("beta_tension (tension)", 0.0, 1.0, value=float(cfg["beta_tension"]), step=0.01)
 
-    k_flux   = st.slider("k_flux (env→cell pump)", 0.0, 1.0, float(cfg["k_flux"]), 0.01)
-    k_motor  = st.slider("k_motor (motor randomness)", 0.0, 5.0, float(cfg["k_motor"]), 0.05)
-    diffuse  = st.slider("diffuse (substrate)", 0.0, 1.0, float(cfg["diffuse"]), 0.01)
-    decay    = st.slider("decay (substrate)",   0.0, 0.2, float(cfg["decay"]),   0.005)
+    decay   = st.number_input("decay",   0.0, 0.5, value=float(cfg["decay"]),   step=0.001)
+    diffuse = st.number_input("diffuse", 0.0, 1.0, value=float(cfg["diffuse"]), step=0.01)
 
-    st.markdown("**Environment (space–time)**")
-    env_len  = st.number_input("env.length", 8, 4096, value=int(cfg["env"]["length"]), step=8)
-    env_noise= st.slider("env.noise_sigma", 0.0, 0.2, float(cfg["env"]["noise_sigma"]), 0.001)
+    gate_win = st.number_input("gate_win (half width K)", 1, 64, value=int(cfg["gate_win"]))
+    eta      = st.number_input("eta (kernel LR)", 0.000, 1.0, value=float(cfg["eta"]), step=0.001, format="%.3f")
+    ema_beta = st.number_input("ema_beta (baseline EMA)", 0.000, 1.0, value=float(cfg["ema_beta"]), step=0.01)
+    lam_l1   = st.number_input("lam_l1 (L1 shrink)", 0.00, 1.00, value=float(cfg["lam_l1"]), step=0.01)
+    prune_th = st.number_input("prune_thresh", 0.00, 1.00, value=float(cfg["prune_thresh"]), step=0.01)
+    min_age  = st.number_input("min_age", 0, 100000, value=int(cfg["min_age"]), step=50)
+    spawn_rate = st.number_input("spawn_rate", 0.0, 1.0, value=float(cfg["spawn_rate"]), step=0.01)
+    max_conns  = st.number_input("max_conns", 1, 1024, value=int(cfg["max_conns"]))
 
-    st.caption("Sources JSON (list)")
-    default_src = json.dumps(cfg["env"]["sources"], indent=2)
-    src_text = st.text_area("env.sources", value=default_src, height=160)
+    env_len  = st.number_input("Env length", 32, 4096, value=int(cfg["env"]["length"]))
+    env_sig  = st.number_input("Env noise σ", 0.0, 1.0, value=float(cfg["env"]["noise_sigma"]), step=0.01)
 
-    live_chunk = st.number_input("Live update chunk (frames)", 10, 2000, value=150, step=10)
+    st.caption("Edit env sources JSON")
+    sources_str = st.text_area("Sources JSON", value=json.dumps(cfg["env"]["sources"], indent=2), height=180)
+    try:
+        sources_ok = json.loads(sources_str)
+        st.success("Sources OK")
+    except Exception as e:
+        st.error(f"JSON error: {e}")
+        sources_ok = cfg["env"]["sources"]
 
-    run_btn = st.button("Run / Rerun", type="primary")
+    live = st.checkbox("Live streaming", value=True)
+    chunk = int(st.slider("Refresh chunk (frames)", 20, 500, 150))
 
-# Build the plain dict config from UI
+    combo_mode = st.selectbox("Combined view mode", options=["stacked", "overlay"], index=0)
+
 user_cfg = {
-    "seed": int(seed),
-    "frames": int(frames),
-    "space": int(space),
-    "k_flux": float(k_flux),
-    "k_motor": float(k_motor),
-    "diffuse": float(diffuse),
-    "decay": float(decay),
-    "env": {
-        "length": int(env_len),
-        "frames": int(frames),
-        "noise_sigma": float(env_noise),
-    },
+    "seed": seed, "frames": frames, "space": space, "band": band,
+    "k_flux": k_flux, "k_motor": k_motor, "motor_noise": motor_noise,
+    "c_motor": c_motor, "alpha_move": alpha_move, "beta_tension": beta_tension,
+    "decay": decay, "diffuse": diffuse,
+    "gate_win": gate_win, "eta": eta, "ema_beta": ema_beta,
+    "lam_l1": lam_l1, "prune_thresh": prune_th, "min_age": min_age,
+    "spawn_rate": spawn_rate, "max_conns": max_conns,
+    "env": {"length": env_len, "noise_sigma": env_sig, "frames": frames, "sources": sources_ok},
 }
-try:
-    user_cfg["env"]["sources"] = json.loads(src_text)
-    if not isinstance(user_cfg["env"]["sources"], list):
-        raise ValueError("env.sources must be a list")
-except Exception as e:
-    st.warning(f"Invalid sources JSON. Using default. ({e})")
-    user_cfg["env"]["sources"] = [
-        {"kind": "moving_peak", "amp": 1.2, "speed": 0.02, "width": 6.0, "start": 20}
-    ]
 
-# ---------- layout ----------
-col1, col2 = st.columns([2, 1])
-with col1:
-    st.subheader("Env vs Substrate (live)")
-    env_sub_plot = st.empty()
-with col2:
-    st.subheader("Energy (live)")
-    energy_plot = st.empty()
-
+# ---------------- Main layout ----------------
+st.title("Fuka — Free‑Energy Gradient Simulation (Live)")
 status = st.empty()
+energy_ph = st.empty()
 
-# ---------- run loop ----------
+colA, colB = st.columns(2)
+env_ph = colA.empty()
+subs_ph = colB.empty()
+
+combo_ph = st.container()  # combined view always shown after the two heatmaps
+kern_ph = st.container()
+
+# ---------------- Run button ----------------
 def run_live():
     engine = make_engine(user_cfg)
-    T = engine.T
-    chunk = int(live_chunk)
+    env = engine.env  # fixed
+    S = engine.S      # we will fill as it runs
 
-    t_hist, cell_hist, env_hist, flux_hist = [], [], [], []
+    status.info("Starting…")
 
-    def redraw(t):
-        t_hist.append(t)
-        cell_hist.append(engine.hist.E_cell[-1])
-        env_hist.append(engine.hist.E_env[-1])
-        flux_hist.append(engine.hist.E_flux[-1])
+    # initial draws
+    draw_energy(energy_ph, engine.hist)
+    draw_heatmaps(env_ph, subs_ph, env, S)
+    draw_combined(combo_ph, env, S, mode=combo_mode)
+    draw_kernels(kern_ph, engine)
 
-        # resample current env row (same logic as core)
-        e_row = engine.env[t]
-        if engine.env.shape[1] != engine.X:
-            idx = (np.arange(engine.X) * engine.env.shape[1] // engine.X) % engine.env.shape[1]
-            e_row = e_row[idx]
-        s_row = engine.S[t]
+    last = [-1]  # mutable closure cell
 
-        env_sub_plot.plotly_chart(plot_env_substrate(e_row, s_row), use_container_width=True)
-        energy_plot.plotly_chart(plot_energy(t_hist, cell_hist, env_hist, flux_hist), use_container_width=True)
-        status.info(f"t = {t+1} / {T}")
-
-    last = [-1]
-    def cb(t):
-        if t - last[0] >= chunk or t == T - 1:
+    def cb(t: int):
+        if t - last[0] >= chunk or t == engine.T - 1:
             last[0] = t
-            redraw(t)
+            draw_energy(energy_ph, engine.hist)
+            draw_heatmaps(env_ph, subs_ph, env, engine.S)
+            draw_combined(combo_ph, env, engine.S, mode=combo_mode)
+            draw_kernels(kern_ph, engine)
+            status.success(f"Running… frame {t+1}/{engine.T}")
 
-    engine.run(progress_cb=cb, snapshot_every=chunk)  # snapshot_every is accepted/ignored
-    if last[0] != T - 1:
-        redraw(T - 1)
+    engine.run(progress_cb=cb, snapshot_every=int(chunk))
+    status.success("Done!")
 
-if run_btn:
+if st.button("Run / Rerun", use_container_width=True):
     run_live()
-else:
-    st.caption("Adjust knobs, then press **Run / Rerun**.")
