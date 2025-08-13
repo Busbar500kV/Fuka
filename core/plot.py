@@ -77,13 +77,13 @@ def draw_heatmap_full(placeholder, env_full, subs_full, title="E(t,x) • S(t,x)
         z=En, colorscale="Viridis", colorbar=dict(title="Env", y=0.75), showscale=True,
         zsmooth=False, name="Env"
     ))
-    # use a 2nd heatmap via new yaxis
+    # substrate heatmap (second panel)
     fig.add_trace(go.Heatmap(
         z=Sn, colorscale="Inferno", colorbar=dict(title="Substrate", y=0.25), showscale=True,
         zsmooth=False, name="Substrate", xaxis="x2", yaxis="y2"
     ))
 
-    # Stack them: create two y-axes sharing the same x index range (by default)
+    # Stack them vertically
     fig.update_layout(
         title=title,
         height=520,
