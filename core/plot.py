@@ -1,72 +1,95 @@
-# core/plots.py
+# core/plot.py
+from __future__ import annotations
 import numpy as np
 import plotly.graph_objects as go
-from .organism import History
 
-def _normalize(a: np.ndarray) -> np.ndarray:
-    a = np.array(a, dtype=float)
-    rng = a.max() - a.min()
+# ---------- small helpers ----------
+
+def _normalize(z: np.ndarray) -> np.ndarray:
+    """Safe [0,1] normalize for plotting; handles constants and NaNs."""
+    z = np.asarray(z, dtype=float)
+    if not np.isfinite(z).any():
+        return np.zeros_like(z)
+    zmin = np.nanmin(z)
+    zmax = np.nanmax(z)
+    rng = zmax - zmin
     if rng <= 1e-12:
-        return np.zeros_like(a)
-    return (a - a.min()) / rng
+        return np.zeros_like(z)
+    return (z - zmin) / (rng + 1e-12)
 
-def draw_energy_timeseries(placeholder, hist: History):
-    t  = hist.t if len(hist.t) else [0]
-    Ec = hist.E_cell if len(hist.E_cell) else [0.0]
-    Ee = hist.E_env  if len(hist.E_env)  else [0.0]
-    Ef = hist.E_flux if len(hist.E_flux) else [0.0]
-
+def _fig_dark():
     fig = go.Figure()
-    fig.add_scatter(x=t, y=Ec, mode="lines", name="E_cell")
-    fig.add_scatter(x=t, y=Ee, mode="lines", name="E_env")
-    fig.add_scatter(x=t, y=Ef, mode="lines", name="E_flux")
     fig.update_layout(
-        height=280, margin=dict(l=20,r=10,t=30,b=30),
-        template="plotly_dark", legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
-    )
-    placeholder.plotly_chart(fig, use_container_width=True)
-
-def draw_overlay_last_frame(placeholder, E: np.ndarray, S: np.ndarray):
-    """Overlay env and substrate at the current (last) frame with zoom/pan."""
-    if S.shape[0] == 0:
-        placeholder.empty()
-        return
-    t = S.shape[0] - 1
-    # resample E[t] to substrate width if needed
-    e_row = E[t]
-    xS = S.shape[1]
-    if e_row.shape[0] != xS:
-        idx = (np.arange(xS) * e_row.shape[0] // xS) % e_row.shape[0]
-        e_row = e_row[idx]
-    s_row = S[t]
-
-    En = _normalize(e_row)
-    Sn = _normalize(s_row)
-
-    x = np.arange(xS)
-    fig = go.Figure()
-    fig.add_scatter(x=x, y=En, mode="lines", name="Env (last frame)")
-    fig.add_scatter(x=x, y=Sn, mode="lines", name="Substrate (last frame)")
-    fig.update_layout(
-        height=280, margin=dict(l=20,r=10,t=30,b=30),
         template="plotly_dark",
-        xaxis_title="x", yaxis_title="normalized amplitude",
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+        margin=dict(l=40, r=10, t=40, b=40),
+        height=320,
+        legend=dict(orientation="h", y=1.02, x=0.0),
     )
+    return fig
+
+# ---------- public: energy timeseries ----------
+
+def draw_energy_timeseries(placeholder, t, e_cell, e_env, e_flux, title="Energy vs time"):
+    """
+    Overwrites the placeholder with a single up-to-date time series figure.
+    Inputs:
+      - t: 1D array/list of ints
+      - e_cell, e_env, e_flux: 1D arrays/lists same length as t
+    """
+    fig = _fig_dark()
+    fig.add_trace(go.Scatter(x=t, y=e_cell, name="E_cell", mode="lines"))
+    fig.add_trace(go.Scatter(x=t, y=e_env,  name="E_env",  mode="lines"))
+    fig.add_trace(go.Scatter(x=t, y=e_flux, name="E_flux", mode="lines"))
+    fig.update_layout(title=title, xaxis_title="t (frame)", yaxis_title="Energy")
     placeholder.plotly_chart(fig, use_container_width=True)
 
-def draw_heatmap_full(placeholder, A: np.ndarray, title: str = "Heatmap"):
-    """Show the full T×X array as a single heatmap (dark theme)."""
-    # Normalize per-plot for contrast
-    An = _normalize(A)
-    fig = go.Figure(data=go.Heatmap(
-        z=An, colorscale="Viridis", colorbar=dict(title="norm")
+# ---------- public: combined overlay (last frame) ----------
+
+def draw_overlay_last_frame(placeholder, env_row, subs_row, title="Env + Substrate (last frame)"):
+    """
+    Draw a single combined line plot for the last-frame slice:
+      env_row: 1D array of environment at t = last
+      subs_row: 1D array of substrate at t = last (same length as env_row after any resample)
+    """
+    x = np.arange(len(env_row))
+    fig = _fig_dark()
+    fig.add_trace(go.Scatter(x=x, y=env_row, name="Env", mode="lines"))
+    fig.add_trace(go.Scatter(x=x, y=subs_row, name="Substrate", mode="lines"))
+    fig.update_layout(title=title, xaxis_title="x (space index)", yaxis_title="value")
+    placeholder.plotly_chart(fig, use_container_width=True)
+
+# ---------- public: full heatmaps (env + substrate) ----------
+
+def draw_heatmap_full(placeholder, env_full, subs_full, title="E(t,x) • S(t,x)"):
+    """
+    Overwrites the placeholder with a single figure containing two heatmaps
+    stacked vertically: top = Env(t,x), bottom = Substrate(t,x).
+      env_full  : 2D array [T, X_env]
+      subs_full : 2D array [T, X_space]
+    Both are normalized to [0,1] for display.
+    """
+    En = _normalize(env_full)
+    Sn = _normalize(subs_full)
+
+    fig = _fig_dark()
+    # environment heatmap
+    fig.add_trace(go.Heatmap(
+        z=En, colorscale="Viridis", colorbar=dict(title="Env", y=0.75), showscale=True,
+        zsmooth=False, name="Env"
     ))
+    # use a 2nd heatmap via new yaxis
+    fig.add_trace(go.Heatmap(
+        z=Sn, colorscale="Inferno", colorbar=dict(title="Substrate", y=0.25), showscale=True,
+        zsmooth=False, name="Substrate", xaxis="x2", yaxis="y2"
+    ))
+
+    # Stack them: create two y-axes sharing the same x index range (by default)
     fig.update_layout(
         title=title,
-        height=320, margin=dict(l=20,r=10,t=35,b=30),
-        template="plotly_dark",
-        xaxis_title="x (space)", yaxis_title="t (frames)",
-        yaxis=dict(autorange="reversed")  # show t=0 at top
+        height=520,
+        xaxis=dict(domain=[0, 1], anchor="y"),
+        yaxis=dict(domain=[0.55, 1.0], title="t (Env)"),
+        xaxis2=dict(domain=[0, 1], anchor="y2"),
+        yaxis2=dict(domain=[0.0, 0.45], title="t (Substrate)"),
     )
     placeholder.plotly_chart(fig, use_container_width=True)
