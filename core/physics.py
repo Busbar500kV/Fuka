@@ -1,22 +1,38 @@
 # core/physics.py
 import numpy as np
 
-def diffuse_decay(prev: np.ndarray, diffuse: float, decay: float) -> np.ndarray:
-    left = np.roll(prev, 1)
-    right = np.roll(prev, -1)
-    d = prev + diffuse * (0.5 * (left + right) - prev)
-    return (1.0 - decay) * d
+def resample_row(row: np.ndarray, new_len: int) -> np.ndarray:
+    """Periodic down/up-sample by integer mapping (keeps wrap)."""
+    old_len = row.shape[0]
+    if old_len == new_len:
+        return row
+    idx = (np.arange(new_len) * old_len // new_len) % old_len
+    return row[idx]
 
-def pump(e_row: np.ndarray, s_row: np.ndarray, band: int, k_flux: float) -> np.ndarray:
-    band = max(1, int(band))
-    grad = np.maximum(e_row[:band] - s_row[:band], 0.0)
-    out = np.zeros_like(s_row)
-    out[:band] += k_flux * grad
-    return out
+def step_physics(prev_S: np.ndarray,
+                 env_row: np.ndarray,
+                 k_flux: float,
+                 k_motor: float,
+                 diffuse: float,
+                 decay: float,
+                 rng: np.random.Generator,
+                 band: int = 3) -> tuple[np.ndarray, float]:
+    """One local update step; returns (S_cur, flux_sum)."""
+    # diffusion (nearest neighbors on ring)
+    left  = np.roll(prev_S,  1)
+    right = np.roll(prev_S, -1)
+    S_diffused = prev_S + diffuse * (0.5*(left + right) - prev_S)
+    S_decayed  = (1.0 - decay) * S_diffused
 
-def motor(band: int, k_motor: float, rng) -> np.ndarray:
-    band = max(1, int(band))
-    return k_motor * rng.random(band) if k_motor > 0 else np.zeros(band, dtype=float)
+    # boundary band pump
+    grad = np.maximum(env_row[:band] - S_decayed[:band], 0.0)
+    pump = np.zeros_like(S_decayed)
+    pump[:band] += k_flux * grad
 
-def add_noise(shape, k_noise, rng):
-    return (k_noise * rng.normal(0.0, 1.0, size=shape)) if k_noise > 0 else 0.0
+    # motor exploration noise (boundary band only)
+    mot = np.zeros_like(S_decayed)
+    mot[:band] += k_motor * rng.random(band)
+
+    S_cur = S_decayed + pump + mot
+    flux_sum = float(np.sum(pump))
+    return S_cur, flux_sum
