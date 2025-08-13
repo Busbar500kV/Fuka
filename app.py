@@ -1,168 +1,130 @@
-# app.py — Streamlit UI / orchestration only
+# app.py
 import json
-from typing import Dict, Tuple, Callable
-
+import time
 import numpy as np
 import streamlit as st
-import plotly.graph_objects as go
 
-from sim_core import Engine, default_config  # unchanged physics/knobs
-
-# plotting helpers
-from plots_full import (
-    make_combined_overlay_figure,
-    update_combined_overlay_figure,
-    make_energy_figure,
-    update_energy_figure,
+from core.config import default_config, make_config_from_dict
+from core.engine import Engine
+from core.plots import (
+    draw_energy_timeseries,
+    draw_overlay_last_frame,
+    draw_heatmap_full,
 )
 
-st.set_page_config(page_title="Fuka – Free‑Energy Gradient (Live)", layout="wide")
+st.set_page_config(page_title="Fuka • Free‑Energy Simulation", layout="wide")
 
+# ----------------------
+# Sidebar controls
+# ----------------------
+st.title("Fuka • Free‑Energy Simulation")
 
-def merge_cfg(base: Dict, patch: Dict) -> Dict:
-    out = dict(base)
-    for k, v in patch.items():
-        if isinstance(v, dict) and isinstance(out.get(k), dict):
-            out[k] = merge_cfg(out[k], v)
-        else:
-            out[k] = v
-    return out
+cfg = default_config()
 
+with st.sidebar:
+    st.header("Run Controls")
+    seed   = st.number_input("Seed", min_value=0, max_value=10_000_000, value=cfg["seed"], step=1)
+    frames = st.number_input("Frames", min_value=200, max_value=50_000, value=cfg["frames"], step=200)
+    space  = st.number_input("Substrate cells (space)", min_value=16, max_value=1024, value=cfg["space"], step=16)
 
-def sidebar_controls() -> Dict:
-    """Render controls and return a plain dict config."""
-    st.sidebar.header("Controls")
+    st.divider()
+    st.subheader("Physics")
+    k_flux   = st.slider("k_flux (boundary pump)", 0.0, 1.0, float(cfg["k_flux"]), 0.01)
+    k_motor  = st.slider("k_motor (motor noise @ boundary)", 0.0, 5.0, float(cfg["k_motor"]), 0.01)
+    diffuse  = st.slider("diffuse", 0.0, 0.5, float(cfg["diffuse"]), 0.005)
+    decay    = st.slider("decay", 0.0, 0.2, float(cfg["decay"]), 0.001)
 
-    cfg = default_config()
+    st.divider()
+    st.subheader("Environment")
+    env_len  = st.number_input("Env length (x)", min_value=space, max_value=4096, value=cfg["env"]["length"], step=space)
+    env_noise= st.slider("Env noise σ", 0.0, 0.2, float(cfg["env"]["noise_sigma"]), 0.005)
 
-    # Basics
-    cfg["seed"]   = st.sidebar.number_input("Seed",   0, 10_000, value=int(cfg["seed"]))
-    cfg["frames"] = st.sidebar.number_input("Frames", 100, 50_000, value=int(cfg["frames"]), step=100)
-    cfg["space"]  = st.sidebar.number_input("Space (cells)", 16, 512, value=int(cfg["space"]))
+    st.caption("Sources JSON (e.g. moving peaks). Edit freely.")
+    default_sources = json.dumps(cfg["env"]["sources"], indent=2)
+    sources_text = st.text_area("env.sources JSON", value=default_sources, height=220)
 
-    # Physics knobs (exact same names as in sim_core.Config)
-    cfg["k_flux"]      = st.sidebar.number_input("k_flux (boundary flux)",    0.0, 2.0, value=float(cfg["k_flux"]), step=0.01)
-    cfg["k_motor"]     = st.sidebar.number_input("k_motor (motor explore)",   0.0, 10.0, value=float(cfg["k_motor"]), step=0.01)
-    cfg["motor_noise"] = st.sidebar.number_input("motor_noise",               0.0, 1.0, value=float(cfg.get("motor_noise", 0.02)), step=0.01)
-    cfg["c_motor"]     = st.sidebar.number_input("c_motor (motor work cost)", 0.0, 5.0, value=float(cfg.get("c_motor", 0.8)), step=0.01)
-    cfg["decay"]       = st.sidebar.number_input("decay",                     0.0, 0.5, value=float(cfg["decay"]), step=0.005)
-    cfg["diffuse"]     = st.sidebar.number_input("diffuse",                   0.0, 1.0, value=float(cfg["diffuse"]), step=0.01)
-    cfg["band"]        = st.sidebar.number_input("band (boundary width)",     1,  16,  value=int(cfg.get("band", 3)))
+    st.divider()
+    chunk = st.slider("Update chunk (frames per UI update)", 10, 500, 150, 10)
+    live  = st.toggle("Live streaming", value=True)
 
-    # Gate/kernel (kept; harmless if sim_core ignores some)
-    cfg["gate_win"]  = st.sidebar.number_input("gate_win (half width K)", 1, 64, value=int(cfg.get("gate_win", 30)))
-    cfg["eta"]       = st.sidebar.number_input("eta (kernel LR)",         0.000, 0.5, value=float(cfg.get("eta", 0.02)), step=0.001, format="%.3f")
-    cfg["ema_beta"]  = st.sidebar.number_input("ema_beta (baseline EMA)", 0.000, 1.0, value=float(cfg.get("ema_beta", 0.10)), step=0.01)
-    cfg["lam_l1"]    = st.sidebar.number_input("lam_l1 (L1 shrink)",      0.00,  1.0, value=float(cfg.get("lam_l1", 0.10)), step=0.01)
-    cfg["prune_thresh"] = st.sidebar.number_input("prune_thresh",          0.00,  1.0, value=float(cfg.get("prune_thresh", 0.10)), step=0.01)
+# Parse sources JSON safely
+try:
+    sources = json.loads(sources_text)
+    if not isinstance(sources, list):
+        raise ValueError("sources must be a list of dicts.")
+except Exception as e:
+    st.error(f"Invalid sources JSON: {e}")
+    sources = cfg["env"]["sources"]
 
-    # Environment
-    env = cfg.get("env", {})
-    env_length = st.sidebar.number_input("Env length", 32, 2048, value=int(env.get("length", 512)))
-    env_noise  = st.sidebar.number_input("Env noise σ", 0.0, 1.0, value=float(env.get("noise_sigma", 0.01)), step=0.01)
+# Build run configuration dict
+user_cfg = {
+    "seed": seed,
+    "frames": int(frames),
+    "space": int(space),
+    "k_flux": float(k_flux),
+    "k_motor": float(k_motor),
+    "diffuse": float(diffuse),
+    "decay": float(decay),
+    "env": {
+        "length": int(env_len),
+        "frames": int(frames),
+        "noise_sigma": float(env_noise),
+        "sources": sources,
+    },
+}
 
-    sources_json_default = json.dumps(env.get("sources", [
-        {"kind": "moving_peak", "amp": 1.0, "speed": 0.0,  "width": 4.0, "start": 340}
-    ]), indent=2)
+# ----------------------
+# Layout
+# ----------------------
+col_top = st.columns([1,1,1])
+ph_energy = col_top[0].empty()
+ph_overlay = col_top[1].empty()
+ph_info = col_top[2].container()
 
-    st.sidebar.caption("Sources JSON (list)")
-    txt = st.sidebar.text_area("Edit env sources", value=sources_json_default, height=240)
-    try:
-        sources = json.loads(txt)
-        st.sidebar.success("Sources OK")
-    except Exception as e:
-        st.sidebar.error(f"Invalid JSON: {e}")
-        sources = env.get("sources", [])
+st.divider()
+col_bot = st.columns([1,1])
+ph_env_heat = col_bot[0].empty()
+ph_sub_heat = col_bot[1].empty()
 
-    cfg["env"] = merge_cfg(env, {"length": env_length, "noise_sigma": env_noise, "sources": sources})
+run_btn = st.button("Run", type="primary", use_container_width=True)
 
-    # Live streaming chunk
-    chunk = st.sidebar.slider("Refresh chunk (frames)", 20, 400, 150, step=10)
+# ----------------------
+# Main runner
+# ----------------------
+def run_live():
+    ecfg = make_config_from_dict(user_cfg)
+    engine = Engine(ecfg)
 
-    # Run button
-    run = st.sidebar.button("Run / Rerun", use_container_width=True)
+    # First draw placeholders
+    draw_energy_timeseries(ph_energy, engine.hist)
+    draw_overlay_last_frame(ph_overlay, engine.env, engine.S)
+    draw_heatmap_full(ph_env_heat, engine.env, title="Environment E(t,x)")
+    draw_heatmap_full(ph_sub_heat, engine.S,   title="Substrate S(t,x)")
 
-    st.session_state["chunk"] = int(chunk)
-    return cfg, run
+    last = [-1]  # mutable capture for closure
 
+    def cb(t: int):
+        # update periodically
+        if (t - last[0] >= chunk) or (t == engine.T - 1):
+            last[0] = t
+            # update plots in-place
+            draw_energy_timeseries(ph_energy, engine.hist)
+            draw_overlay_last_frame(ph_overlay, engine.env, engine.S)
+            # For heatmaps: redraw full arrays (one chart each; placeholders prevent stacking)
+            draw_heatmap_full(ph_env_heat, engine.env, title="Environment E(t,x)")
+            draw_heatmap_full(ph_sub_heat, engine.S,   title="Substrate S(t,x)")
 
-def resample_to_env_width(S: np.ndarray, env_width: int) -> np.ndarray:
-    """Resize substrate (T, Xs) to env width (Xe) by linear interpolation along x."""
-    T, Xs = S.shape
-    if Xs == env_width:
-        return S
-    x_src = np.linspace(0, 1, Xs)
-    x_dst = np.linspace(0, 1, env_width)
-    out = np.empty((T, env_width), dtype=S.dtype)
-    for t in range(T):
-        out[t] = np.interp(x_dst, x_src, S[t])
-    return out
+    engine.run(progress_cb=cb if live else None)
 
+    # Final refresh
+    draw_energy_timeseries(ph_energy, engine.hist)
+    draw_overlay_last_frame(ph_overlay, engine.env, engine.S)
+    draw_heatmap_full(ph_env_heat, engine.env, title="Environment E(t,x)")
+    draw_heatmap_full(ph_sub_heat, engine.S,   title="Substrate S(t,x)")
 
-def run():
-    cfg, pressed = sidebar_controls()
+    with ph_info:
+        st.write("**Run complete**")
+        st.json(user_cfg)
 
-    # Placeholders (single instances reused every update)
-    st.title("Fuka – Free‑Energy Gradient Simulation (Live)")
-    combo_ph  = st.empty()
-    energy_ph = st.empty()
-    status    = st.empty()
-
-    if not pressed:
-        st.stop()
-
-    # Build engine AFTER user presses Run
-    engine = Engine.from_dict(cfg) if hasattr(Engine, "from_dict") else Engine(cfg)  # keep compatibility
-
-    # Create figures once we know sizes
-    # Use full env length on x, full time on y for the Heatmap
-    Xe = int(engine.env.shape[1])  # env width
-    T  = int(engine.env.shape[0])  # timeline
-    # Initial data for plots (zeros with correct shape)
-    E0 = np.zeros_like(engine.env)
-    S0 = np.zeros((T, Xe))
-
-    combo_fig  = make_combined_overlay_figure(E0, S0, title="E(t,x) • S(t,x)")
-    energy_fig = make_energy_figure()
-
-    combo_ph.plotly_chart(combo_fig, use_container_width=True)
-    energy_ph.plotly_chart(energy_fig, use_container_width=True)
-    status.info("Starting…")
-
-    chunk = int(st.session_state.get("chunk", 150))
-
-    last_draw_t = -1
-
-    def on_progress(t: int):
-        nonlocal last_draw_t, combo_fig, energy_fig
-        if (t - last_draw_t) >= chunk or t == (engine.T - 1):
-            last_draw_t = t
-
-            # Current arrays
-            E = engine.env[:t+1]                     # (t+1, Xe_env)
-            S = engine.S[:t+1]                       # (t+1, Xs)
-            S_env = resample_to_env_width(S, E.shape[1])
-
-            update_combined_overlay_figure(combo_fig, E, S_env)
-            combo_ph.plotly_chart(combo_fig, use_container_width=True)
-
-            # Energies
-            update_energy_figure(
-                energy_fig,
-                np.array(engine.hist.t),
-                np.array(engine.hist.E_cell),
-                np.array(engine.hist.E_env),
-                np.array(engine.hist.E_flux),
-            )
-            energy_ph.plotly_chart(energy_fig, use_container_width=True)
-
-            status.success(f"t = {t+1}/{engine.T}")
-
-    # Run the simulation (streaming)
-    engine.run(progress_cb=on_progress)
-
-    status.success("Done!")
-
-
-if __name__ == "__main__":
-    run()
+if run_btn:
+    run_live()
