@@ -1,2 +1,2 @@
 [server]
-folderWatchBlacklist = ["data", "logs", "outputs"]
+fileWatcherType = "none"
