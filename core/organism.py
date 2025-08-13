@@ -1,4 +1,10 @@
 # core/organism.py
-def advance_boundary(offset: float, motor_mass: float, speed: float, X_env: int) -> float:
-    # Offset advances proportionally to how much “motor” we generated in the band.
-    return (offset + speed * motor_mass) % float(X_env)
+from dataclasses import dataclass, field
+from typing import List
+
+@dataclass
+class History:
+    t: List[int] = field(default_factory=list)
+    E_cell: List[float] = field(default_factory=list)
+    E_env:  List[float] = field(default_factory=list)
+    E_flux: List[float] = field(default_factory=list)
