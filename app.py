@@ -6,11 +6,7 @@ import streamlit as st
 
 from core.config import default_config, make_config_from_dict
 from core.engine import Engine
-from core.plots import (
-    draw_energy_timeseries,
-    draw_overlay_last_frame,
-    draw_heatmap_full,
-)
+from core.plots import draw_energy_timeseries, draw_overlay_last_frame, draw_heatmap_full
 
 st.set_page_config(page_title="Fuka • Free‑Energy Simulation", layout="wide")
 
