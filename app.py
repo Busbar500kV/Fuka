@@ -6,7 +6,7 @@ import streamlit as st
 
 from core.config import default_config, make_config_from_dict
 from core.engine import Engine
-from core.plots import (
+from core.plot import (
     draw_energy_timeseries,
     draw_overlay_last_frame,
     draw_heatmap_full,
