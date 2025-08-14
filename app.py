@@ -96,7 +96,7 @@ def run_live():
     engine = Engine(ecfg)
 
     # First draw placeholders
-    draw_energy_timeseries(ph_energy, engine.hist)
+    draw_energy_timeseries(ph_energy, engine.hist.t,engine.hist.e_cell,engine.hist.e_env,engine.hist.e_flux)
     draw_overlay_last_frame(ph_overlay, engine.env, engine.S)
     draw_heatmap_full(ph_env_heat, engine.env, title="Environment E(t,x)")
     draw_heatmap_full(ph_sub_heat, engine.S,   title="Substrate S(t,x)")
