@@ -76,16 +76,19 @@ user_cfg = {
 # ----------------------
 # Layout
 # ----------------------
-col_top = st.columns([1,1,1])
-ph_energy = col_top[0].empty()
-ph_overlay = col_top[1].empty()
-ph_info = col_top[2].container()
+# --- TOP: controls & quick views ---
+c1, c2, c3 = st.columns([1.2, 1.2, 0.9])
+
+ph_energy  = c1.empty()      # live energy time‑series
+ph_last    = c2.empty()      # last‑frame overlay (Env vs Substrate at t = now)
+with c3:                     # compact info stack (numbers, buttons, JSON, etc.)
+    ph_info = st.container()
 
 st.divider()
-col_bot = st.columns([1,1])
-ph_env_heat = col_bot[0].empty()
-# ph_sub_heat = col_bot[1].empty()
 
+# --- BOTTOM: full-width, zoomable combined heatmap ---
+combo_section = st.container()
+ph_combo      = combo_section.empty()
 run_btn = st.button("Run", type="primary", use_container_width=True)
 
 # ----------------------
@@ -97,8 +100,8 @@ def run_live():
 
     # First draw placeholders
     draw_energy_timeseries(ph_energy, engine.hist.t, engine.hist.E_cell, engine.hist.E_env, engine.hist.E_flux)
-    draw_overlay_last_frame(ph_overlay, engine.env, engine.S)
-    # draw_heatmap_full(ph_env_heat, engine.env, engine.S, title="Environment E(t,x)")
+    draw_overlay_last_frame(ph_last, engine.env, engine.S)
+    draw_heatmap_full(ph_combo, engine.env, engine.S, title="Environment E(t,x)")
     # draw_heatmap_full(ph_sub_heat, engine.S,   title="Substrate S(t,x)")
 
     last = [-1]  # mutable capture for closure
@@ -109,17 +112,17 @@ def run_live():
             last[0] = t
             # update plots in-place
             draw_energy_timeseries(ph_energy, engine.hist.t, engine.hist.E_cell, engine.hist.E_env, engine.hist.E_flux)
-            draw_overlay_last_frame(ph_overlay, engine.env, engine.S)
+            draw_overlay_last_frame(ph_last, engine.env, engine.S)
             # For heatmaps: redraw full arrays (one chart each; placeholders prevent stacking)
-            # draw_heatmap_full(ph_env_heat, engine.env, engine.S, title="Environment E(t,x)")
+            draw_heatmap_full(ph_combo, engine.env, engine.S, title="Environment E(t,x)")
             # draw_heatmap_full(ph_sub_heat, engine.S,   title="Substrate S(t,x)")
 
     engine.run(progress_cb=cb if live else None)
 
     # Final refresh
     draw_energy_timeseries(ph_energy, engine.hist.t, engine.hist.E_cell, engine.hist.E_env, engine.hist.E_flux)
-    draw_overlay_last_frame(ph_overlay, engine.env, engine.S)
-    # draw_heatmap_full(ph_env_heat, engine.env, engine.S, title="Environment E(t,x)")
+    draw_overlay_last_frame(ph_last, engine.env, engine.S)
+    draw_heatmap_full(ph_combo, engine.env, engine.S, title="Environment E(t,x)")
     # draw_heatmap_full(ph_sub_heat, engine.S,   title="Substrate S(t,x)")
 
     with ph_info:
