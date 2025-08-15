@@ -60,7 +60,7 @@ def draw_overlay_last_frame(placeholder, env_row, subs_row, title="Env + Substra
 
 # ---------- public: full heatmaps (env + substrate) ----------
 
-def draw_heatmap_full(placeholder, env_full, subs_full, title="E(t,x) • S(t,x)"):
+def draw_heatmap_full2(placeholder, env_full, subs_full, title="E(t,x) • S(t,x)"):
     """
     Overwrites the placeholder with a single figure containing two heatmaps
     stacked vertically: top = Env(t,x), bottom = Substrate(t,x).
@@ -92,4 +92,101 @@ def draw_heatmap_full(placeholder, env_full, subs_full, title="E(t,x) • S(t,x)
         xaxis2=dict(domain=[0, 1], anchor="y2"),
         yaxis2=dict(domain=[0.0, 0.45], title="t (Substrate)"),
     )
+    placeholder.plotly_chart(fig, use_container_width=True)
+    
+    
+import numpy as np
+import plotly.graph_objects as go
+
+def _normalize_z(z: np.ndarray) -> np.ndarray:
+    zmin = np.nanmin(z)
+    zptp = np.nanmax(z) - zmin
+    if not np.isfinite(zptp) or zptp == 0.0:
+        return np.zeros_like(z)
+    return (z - zmin) / (zptp + 1e-12)
+
+def _resample_width(arr_2d: np.ndarray, new_w: int) -> np.ndarray:
+    """
+    Resample a 2D array [T, W_old] to [T, new_w] by 1D interpolation along width.
+    Keeps T unchanged. Works for either env or substrate.
+    """
+    T, W = arr_2d.shape
+    if W == new_w:
+        return arr_2d
+    # original and target x-coordinates in [0,1]
+    x_old = np.linspace(0.0, 1.0, W)
+    x_new = np.linspace(0.0, 1.0, new_w)
+    out = np.empty((T, new_w), dtype=float)
+    for t in range(T):
+        out[t] = np.interp(x_new, x_old, arr_2d[t])
+    return out
+
+def _fig_dark():
+    fig = go.Figure()
+    fig.update_layout(
+        template="plotly_dark",
+        margin=dict(l=40, r=60, t=50, b=40),
+        height=520,
+    )
+    return fig
+
+def draw_heatmap_full(placeholder, env_full: np.ndarray, subs_full: np.ndarray,
+                                  title="Combined heatmap: Env ⬤ + Substrate ⬤"):
+    """
+    Overlay Env(t,x) and Substrate(t,x) on *one* zoomable heatmap (shared axes).
+      - Resamples both to X_max = max(env_x, subs_x)
+      - Normalizes each independently to [0,1] for visibility
+      - Uses two color scales with opacity so both layers are visible
+    """
+    if env_full.ndim != 2 or subs_full.ndim != 2:
+        raise ValueError("env_full and subs_full must be 2D arrays [T, X].")
+
+    T_env, X_env = env_full.shape
+    T_sub, X_sub = subs_full.shape
+    if T_env != T_sub:
+        # If lengths differ a little due to streaming, trim to the shortest
+        T = min(T_env, T_sub)
+        E = env_full[:T]
+        S = subs_full[:T]
+    else:
+        T = T_env
+        E = env_full
+        S = subs_full
+
+    X_max = int(max(X_env, X_sub))
+    # resample to a common width (max of the two)
+    E_r = _resample_width(E, X_max)
+    S_r = _resample_width(S, X_max)
+
+    # normalize each to [0,1] to keep contrast
+    En = _normalize_z(E_r)
+    Sn = _normalize_z(S_r)
+
+    fig = _fig_dark()
+    # Env layer
+    fig.add_trace(go.Heatmap(
+        z=En,
+        colorscale="Viridis",
+        zsmooth=False,
+        opacity=0.60,
+        showscale=True,
+        colorbar=dict(title="Env", x=1.02)
+    ))
+    # Substrate layer
+    fig.add_trace(go.Heatmap(
+        z=Sn,
+        colorscale="Inferno",
+        zsmooth=False,
+        opacity=0.55,
+        showscale=True,
+        colorbar=dict(title="Substrate", x=1.10)
+    ))
+
+    fig.update_layout(
+        title=title,
+        xaxis=dict(title=f"x (space, width={X_max})"),
+        yaxis=dict(title="t (frames)", autorange="reversed"),  # t=0 at top looks like a raster over time
+    )
+
+    # one interactive, zoomable view
     placeholder.plotly_chart(fig, use_container_width=True)
