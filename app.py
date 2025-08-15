@@ -84,7 +84,7 @@ ph_info = col_top[2].container()
 st.divider()
 col_bot = st.columns([1,1])
 ph_env_heat = col_bot[0].empty()
-ph_sub_heat = col_bot[1].empty()
+# ph_sub_heat = col_bot[1].empty()
 
 run_btn = st.button("Run", type="primary", use_container_width=True)
 
@@ -109,10 +109,10 @@ def run_live():
             last[0] = t
             # update plots in-place
             draw_energy_timeseries(ph_energy, engine.hist)
-            draw_overlay_last_frame(ph_overlay, engine.env, engine.S)
+            # draw_overlay_last_frame(ph_overlay, engine.env, engine.S)
             # For heatmaps: redraw full arrays (one chart each; placeholders prevent stacking)
-            draw_heatmap_full(ph_env_heat, engine.env, title="Environment E(t,x)")
-            draw_heatmap_full(ph_sub_heat, engine.S,   title="Substrate S(t,x)")
+            draw_heatmap_full(ph_env_heat, engine.env, engine.S, title="Environment E(t,x)")
+            # draw_heatmap_full(ph_sub_heat, engine.S,   title="Substrate S(t,x)")
 
     engine.run(progress_cb=cb if live else None)
 
