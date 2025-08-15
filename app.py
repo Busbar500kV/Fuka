@@ -117,10 +117,10 @@ def run_live():
     engine.run(progress_cb=cb if live else None)
 
     # Final refresh
-    draw_energy_timeseries(ph_energy, engine.hist)
-    draw_overlay_last_frame(ph_overlay, engine.env, engine.S)
-    draw_heatmap_full(ph_env_heat, engine.env, title="Environment E(t,x)")
-    draw_heatmap_full(ph_sub_heat, engine.S,   title="Substrate S(t,x)")
+    draw_energy_timeseries(ph_energy, engine.hist.t, engine.hist.E_cell, engine.hist.E_env, engine.hist.E_flux)
+    # draw_overlay_last_frame(ph_overlay, engine.env, engine.S)
+    draw_heatmap_full(ph_env_heat, engine.env, engine.S, title="Environment E(t,x)")
+    # draw_heatmap_full(ph_sub_heat, engine.S,   title="Substrate S(t,x)")
 
     with ph_info:
         st.write("**Run complete**")
