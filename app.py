@@ -101,7 +101,7 @@ def run_live():
     # First draw placeholders
     draw_energy_timeseries(ph_energy, engine.hist.t, engine.hist.E_cell, engine.hist.E_env, engine.hist.E_flux)
     draw_overlay_last_frame(ph_last, engine.env, engine.S)
-    draw_heatmap_full(ph_combo, engine.env, engine.S, title="Environment E(t,x)")
+    # draw_heatmap_full(ph_combo, engine.env, engine.S, title="Environment E(t,x)")
     # draw_heatmap_full(ph_sub_heat, engine.S,   title="Substrate S(t,x)")
 
     last = [-1]  # mutable capture for closure
@@ -114,7 +114,7 @@ def run_live():
             draw_energy_timeseries(ph_energy, engine.hist.t, engine.hist.E_cell, engine.hist.E_env, engine.hist.E_flux)
             draw_overlay_last_frame(ph_last, engine.env, engine.S)
             # For heatmaps: redraw full arrays (one chart each; placeholders prevent stacking)
-            draw_heatmap_full(ph_combo, engine.env, engine.S, title="Environment E(t,x)")
+            # draw_heatmap_full(ph_combo, engine.env, engine.S, title="Environment E(t,x)")
             # draw_heatmap_full(ph_sub_heat, engine.S,   title="Substrate S(t,x)")
 
     engine.run(progress_cb=cb if live else None)
@@ -122,7 +122,7 @@ def run_live():
     # Final refresh
     draw_energy_timeseries(ph_energy, engine.hist.t, engine.hist.E_cell, engine.hist.E_env, engine.hist.E_flux)
     draw_overlay_last_frame(ph_last, engine.env, engine.S)
-    draw_heatmap_full(ph_combo, engine.env, engine.S, title="Environment E(t,x)")
+    # draw_heatmap_full(ph_combo, engine.env, engine.S, title="Environment E(t,x)")
     # draw_heatmap_full(ph_sub_heat, engine.S,   title="Substrate S(t,x)")
 
     with ph_info:
