@@ -108,7 +108,7 @@ def run_live():
         if (t - last[0] >= chunk) or (t == engine.T - 1):
             last[0] = t
             # update plots in-place
-            draw_energy_timeseries(ph_energy, engine.hist)
+            draw_energy_timeseries(ph_energy, engine.hist.t, engine.hist.E_cell, engine.hist.E_env, engine.hist.E_flux)
             # draw_overlay_last_frame(ph_overlay, engine.env, engine.S)
             # For heatmaps: redraw full arrays (one chart each; placeholders prevent stacking)
             draw_heatmap_full(ph_env_heat, engine.env, engine.S, title="Environment E(t,x)")
