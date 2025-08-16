@@ -100,7 +100,7 @@ def run_live():
     # Ensure a persistent figure exists
     if combo_key not in st.session_state or st.session_state.get("reset_combo", False):
         # Make an initial figure with a 1-row slice so shapes are valid
-        env_init  = engine.env_full[:1, :]
+        env_init  = engine.env[:1, :]
         subs_init = engine.S[:1, :]
         st.session_state[combo_key] = make_combo_fig(env_init, subs_init)
         st.session_state["reset_combo"] = False
@@ -120,7 +120,7 @@ def run_live():
                 fig = st.session_state[combo_key]
                 
                 # Update in place with data up to t (inclusive)
-                env_slice  = engine.env_full[:t+1, :]
+                env_slice  = engine.env[:t+1, :]
                 subs_slice = engine.S[:t+1, :]
                 
                 # IMPORTANT: update function should modify and return the same fig
