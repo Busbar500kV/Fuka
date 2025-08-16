@@ -95,7 +95,7 @@ def run_live():
     
     # Once, before the loop:
     combo_key = "combo_fig"
-    fig_combo = ensure_combo_fig(combo_key, T=engine.T, X_env=engine.env_full.shape[1], X_space=engine.S.shape[1], height=520)
+    fig_combo = ensure_combo_fig(combo_key, T=engine.T, X_env=engine.env.shape[1], X_space=engine.S.shape[1], height=520)
 
     last = [-1]  # mutable capture for closure
 
