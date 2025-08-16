@@ -11,6 +11,7 @@ from core.plot import (
     draw_overlay_last_frame,
     draw_heatmap_full,
 )
+from smooth_plot_helpers import ensure_combo_fig, update_combo_fig, draw_energy_timeseries_live
 
 st.set_page_config(page_title="Fuka • Free‑Energy Simulation", layout="wide")
 
@@ -83,32 +84,31 @@ st.divider()
 
 run_btn = st.button("Run", type="primary", use_container_width=True)
 
+
+
 # ----------------------
 # Main runner
 # ----------------------
 def run_live():
     ecfg = make_config_from_dict(user_cfg)
     engine = Engine(ecfg)
-
-    # First draw placeholders
-    draw_energy_timeseries(ph_energy, engine.hist.t, engine.hist.E_cell, engine.hist.E_env, engine.hist.E_flux)
-    # draw_overlay_last_frame(ph_last, engine.env, engine.S)
-    draw_heatmap_full(ph_combo, engine.env, engine.S, title="Environment E(t,x)")
-    # draw_heatmap_full(ph_sub_heat, engine.S,   title="Substrate S(t,x)")
+    
+    # Once, before the loop:
+    combo_key = "combo_fig"
+    fig_combo = ensure_combo_fig(combo_key, T=engine.T, X_env=engine.env_full.shape[1], X_space=engine.S.shape[1], height=520)
 
     last = [-1]  # mutable capture for closure
 
     def cb(t: int):
         # update periodically
-        if (t - last[0] >= chunk) or (t == engine.T - 1):
-            last[0] = t
-            # update plots in-place
-            draw_energy_timeseries(ph_energy, engine.hist.t, engine.hist.E_cell, engine.hist.E_env, engine.hist.E_flux)
-            # draw_overlay_last_frame(ph_last, engine.env, engine.S)
-            # For heatmaps: redraw full arrays (one chart each; placeholders prevent stacking)
-            draw_heatmap_full(ph_combo, engine.env, engine.S, title="Environment E(t,x)")
-            # draw_heatmap_full(ph_sub_heat, engine.S,   title="Substrate S(t,x)")
-
+        if t % chunk == 0 or t == engine.T - 1:
+            # Update heatmap in place
+            fig_combo = update_combo_fig(fig_combo, engine.env_full[:t+1], engine.S[:t+1])
+            ph_combo.plotly_chart(fig_combo, use_container_width=True, theme=None)
+            
+            # Update energy lines
+            draw_energy_timeseries_live(ph_energy, engine.hist.t, engine.hist.E_cell, engine.hist.E_env, engine.hist.E_flux)
+    
     engine.run(progress_cb=cb if live else None)
 
     # Final refresh
