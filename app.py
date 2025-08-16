@@ -6,11 +6,11 @@ import streamlit as st
 
 from core.config import default_config, make_config_from_dict
 from core.engine import Engine
-from core.plot import (
-    draw_energy_timeseries,
-    draw_overlay_last_frame,
-    draw_heatmap_full,
-)
+#from core.plot import (
+#    draw_energy_timeseries,
+#    draw_overlay_last_frame,
+#    draw_heatmap_full,
+#)
 from smooth_plot_helpers import (
     ensure_combo_fig,
     update_combo_fig,
@@ -86,8 +86,6 @@ ph_info   = st.container()
 st.divider()
 
 run_btn = st.button("Run", type="primary", use_container_width=True)
-
-
 
 # ----------------------
 # Main runner
