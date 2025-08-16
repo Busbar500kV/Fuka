@@ -16,6 +16,10 @@ from smooth_plot_helpers import (
     update_combo_fig,
     draw_energy_timeseries_live,
 )
+
+import inspect
+print("ensure_combo_fig ->", inspect.signature(ensure_combo_fig))
+
 st.set_page_config(page_title="Fuka • Free‑Energy Simulation", layout="wide")
 
 # ----------------------
