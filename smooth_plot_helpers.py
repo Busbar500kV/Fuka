@@ -1,4 +1,4 @@
-# core/smooth_plot_helpers.py
+# smooth_plot_helpers.py
 # Helpers for smooth, live Plotly updates (no blinking) and a combined heatmap.
 
 from __future__ import annotations
