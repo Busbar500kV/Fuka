@@ -11,7 +11,7 @@ from core.plot import (
     draw_overlay_last_frame,
     draw_heatmap_full,
 )
-from core.smooth_plot_helpers import (
+from smooth_plot_helpers import (
     ensure_combo_fig,
     update_combo_fig,
     draw_energy_timeseries_live,
