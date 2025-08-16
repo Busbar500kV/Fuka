@@ -11,8 +11,11 @@ from core.plot import (
     draw_overlay_last_frame,
     draw_heatmap_full,
 )
-from smooth_plot_helpers import ensure_combo_fig, update_combo_fig, draw_energy_timeseries_live
-
+from core.smooth_plot_helpers import (
+    ensure_combo_fig,
+    update_combo_fig,
+    draw_energy_timeseries_live,
+)
 st.set_page_config(page_title="Fuka • Free‑Energy Simulation", layout="wide")
 
 # ----------------------
@@ -93,10 +96,15 @@ def run_live():
     ecfg = make_config_from_dict(user_cfg)
     engine = Engine(ecfg)
     
-    # ---------- before the loop ----------
-    
     combo_key = "combo_fig"
-    
+    fig_combo = ensure_combo_fig(combo_key,
+    T=engine.T,
+    X_env=engine.env.shape[1],
+    X_space=engine.S.shape[1],
+    height=520,
+    title="Env + Substrate (combined, zoomable)"
+)
+        
     # Ensure a persistent figure exists
     if combo_key not in st.session_state or st.session_state.get("reset_combo", False):
         # Make an initial figure with a 1-row slice so shapes are valid
@@ -104,39 +112,19 @@ def run_live():
         subs_init = engine.S[:1, :]
         st.session_state[combo_key] = make_combo_fig(env_init, subs_init)
         st.session_state["reset_combo"] = False
-
-
+    
     def cb(t: int):
-        
-        # ---------- run loop ----------
-        
-        chunk = int(chunk)  # make sure it's an int
-        
-        for t in range(engine.T):
-            engine.step(t)
-            
-            if (t % chunk == 0) or (t == engine.T - 1):
-                # Always pull the figure from session_state
-                fig = st.session_state[combo_key]
-                
-                # Update in place with data up to t (inclusive)
-                env_slice  = engine.env[:t+1, :]
-                subs_slice = engine.S[:t+1, :]
-                
-                # IMPORTANT: update function should modify and return the same fig
-                fig = update_combo_fig(fig, env_slice, subs_slice)
-                
-                # Store it back so it persists across reruns and scopes
-                st.session_state[combo_key] = fig
-                
-                # Re-draw without creating a new figure object (reduces blink)
-                ph_combo.plotly_chart(fig, use_container_width=True)
-                
-                # Update energy plot too
-                draw_energy_timeseries(
-                ph_energy,
-                engine.hist.t, engine.hist.E_cell, engine.hist.E_env, engine.hist.E_flux
-                )
+    if t % chunk == 0 or t == engine.T - 1:
+        update_combo_fig(fig_combo, engine.env[:t+1], engine.S[:t+1])
+        ph_combo.plotly_chart(fig_combo, use_container_width=True, theme=None)
+
+        draw_energy_timeseries_live(
+            ph_energy,
+            engine.hist.t,
+            engine.hist.E_cell,
+            engine.hist.E_env,
+            engine.hist.E_flux,
+        )
         
     engine.run(progress_cb=cb if live else None)
 
