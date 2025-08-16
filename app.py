@@ -76,19 +76,11 @@ user_cfg = {
 # ----------------------
 # Layout
 # ----------------------
-# --- TOP: controls & quick views ---
-c1, c2, c3 = st.columns([1.2, 1.2, 0.9])
-
-ph_energy  = c1.empty()      # live energy time‑series
-ph_last    = c2.empty()      # last‑frame overlay (Env vs Substrate at t = now)
-with c3:                     # compact info stack (numbers, buttons, JSON, etc.)
-    ph_info = st.container()
-
+ph_combo  = st.empty()
+ph_energy = st.empty()
+ph_info   = st.container()
 st.divider()
 
-# --- BOTTOM: full-width, zoomable combined heatmap ---
-combo_section = st.container()
-ph_combo      = combo_section.empty()
 run_btn = st.button("Run", type="primary", use_container_width=True)
 
 # ----------------------
