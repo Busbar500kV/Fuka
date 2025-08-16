@@ -103,7 +103,7 @@ def run_live():
         # update periodically
         if t % chunk == 0 or t == engine.T - 1:
             # Update heatmap in place
-            fig_combo = update_combo_fig(fig_combo, engine.env_full[:t+1], engine.S[:t+1])
+            fig_combo = update_combo_fig(fig_combo, engine.env[:t+1], engine.S[:t+1])
             ph_combo.plotly_chart(fig_combo, use_container_width=True, theme=None)
             
             # Update energy lines
