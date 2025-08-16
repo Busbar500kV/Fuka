@@ -114,17 +114,17 @@ def run_live():
         st.session_state["reset_combo"] = False
     
     def cb(t: int):
-    if t % chunk == 0 or t == engine.T - 1:
-        update_combo_fig(fig_combo, engine.env[:t+1], engine.S[:t+1])
-        ph_combo.plotly_chart(fig_combo, use_container_width=True, theme=None)
-
-        draw_energy_timeseries_live(
-            ph_energy,
-            engine.hist.t,
-            engine.hist.E_cell,
-            engine.hist.E_env,
-            engine.hist.E_flux,
-        )
+        if t % chunk == 0 or t == engine.T - 1:
+            update_combo_fig(fig_combo, engine.env[:t+1], engine.S[:t+1])
+            ph_combo.plotly_chart(fig_combo, use_container_width=True, theme=None)
+    
+            draw_energy_timeseries_live(
+                ph_energy,
+                engine.hist.t,
+                engine.hist.E_cell,
+                engine.hist.E_env,
+                engine.hist.E_flux,
+            )
         
     engine.run(progress_cb=cb if live else None)
 
