@@ -5,6 +5,13 @@ from .env import build_env
 from .organism import History
 from .physics import step_physics, resample_row
 
+from core.connections import init_connections, grow_connections, prune_connections, plasticity_step, gaussian_kernels
+self.conn = init_connections(X=cfg.space, N=cfg.n_conn, rng=self.rng,
+                             n_seed=cfg.n_seed,
+                             ell_prior=(cfg.ell_min, cfg.ell_max),
+                             tau_prior=(cfg.tau_min, cfg.tau_max),
+                             energy0=0.0)
+
 class Engine:
     """Streaming-capable engine with simple local rules."""
     def __init__(self, cfg: Config):
