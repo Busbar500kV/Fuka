@@ -11,6 +11,7 @@ from .config import Config
 from .env import build_env
 from .organism import History
 from .physics import step_physics, resample_row
+from .connection import plasticity_step
 
 # --- Optional connections layer ---------------------------------------------
 _HAS_CONN = False
