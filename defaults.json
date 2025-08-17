@@ -1,0 +1,36 @@
+{
+  "seed": 0,
+  "frames": 1200,
+  "space": 64,
+  "k_flux": 0.08,
+  "k_motor": 0.20,
+  "diffuse": 0.05,
+  "decay": 0.05,
+
+  "n_conn": 128,
+  "n_seed": 4,
+  "ell_min": 0.05,
+  "ell_max": 0.40,
+  "tau_min": 1.0,
+  "tau_max": 16.0,
+  "conn_grow_every": 50,
+  "conn_grow_budget": 4,
+  "conn_prune_every": 100,
+  "conn_prune_min_age": 40,
+  "conn_prune_thresh": 0.01,
+
+  "c_motor": 0.06,
+  "S_max": 1.0,
+
+  "env": {
+    "length": 512,
+    "frames": 1200,
+    "noise_sigma": 0.01,
+    "sources": [
+      { "kind": "moving_peak", "amp": 1.0, "speed": 0.0, "width": 4.0, "start": 100 }
+    ]
+  },
+
+  "chunk": 150,
+  "live": true
+}
