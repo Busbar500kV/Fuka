@@ -170,15 +170,23 @@ def prune_connections(state: ConnectionState,
     return int(kill.size)
 
 
-def plasticity_step(state: ConnectionState,
+def plasticity_step(state: "ConnectionState",
                     rng: np.random.Generator,
                     sigma_ell: float = 0.05,
                     sigma_tau: float = 0.05,
-                    p_move: float = 0.05) -> None:
+                    p_move: float = 0.05,
+                    env_row: np.ndarray | None = None,
+                    subs_row: np.ndarray | None = None,
+                    **kwargs) -> None:
     """
     Small local mutations on alive connections:
       - ell, tau jitter (non-negative clamp)
       - with prob p_move, shift x by ±1 (ring)
+
+    If env_row is provided, we (optionally) bias the one-step move toward
+    higher env locally. If subs_row is provided, we can damp moves in
+    already-high substrate (prevent thrashing). If neither is provided,
+    behavior is identical to the old version.
     """
     idx = state.alive_idx()
     if idx.size == 0:
@@ -190,10 +198,47 @@ def plasticity_step(state: ConnectionState,
 
     # occasional one-step move along the ring
     move_mask = rng.random(idx.size) < p_move
-    if np.any(move_mask):
-        step = rng.integers(-1, 2, size=move_mask.sum())  # -1, 0, +1
-        state.x[idx[move_mask]] = (state.x[idx[move_mask]] + step) % state.X
+    if not np.any(move_mask):
+        return
 
+    # default unbiased steps: -1, 0, +1
+    steps = rng.integers(-1, 2, size=move_mask.sum())
+
+    if env_row is not None and env_row.size == state.X:
+        pos = state.x[idx[move_mask]]
+        left_pos  = (pos - 1) % state.X
+        right_pos = (pos + 1) % state.X
+
+        cur_e   = env_row[pos]
+        left_e  = env_row[left_pos]
+        right_e = env_row[right_pos]
+
+        # local preference for higher env vs current
+        p_left  = (left_e  > cur_e).astype(float)
+        p_right = (right_e > cur_e).astype(float)
+        p_stay  = 1.0 - np.maximum(p_left, p_right) * 0.5  # keep some stay prob
+
+        # optionally damp movement where substrate is already high
+        if subs_row is not None and subs_row.size == state.X:
+            cur_s = subs_row[pos]
+            # Larger substrate → more "stickiness"
+            stick = 1.0 / (1.0 + cur_s)
+            p_left  *= stick
+            p_right *= stick
+            # keep p_stay as-is so stickiness increases staying
+
+        psum = p_left + p_right + p_stay
+        # normalize or fallback to uniform if degenerate
+        ok = psum > 0
+        p_left  = np.where(ok, p_left/psum, 1/3)
+        p_stay  = np.where(ok, p_stay/psum, 1/3)
+        p_right = np.where(ok, p_right/psum, 1/3)
+
+        r = rng.random(move_mask.sum())
+        steps = np.where(r < p_left, -1,
+                 np.where(r < p_left + p_stay, 0, +1))
+
+    state.x[idx[move_mask]] = (state.x[idx[move_mask]] + steps) % state.X
 
 def age_and_dissipate(state: ConnectionState,
                       dissipation: float = 0.0) -> None:
