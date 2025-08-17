@@ -1,38 +1,51 @@
 # core/physics.py
 import numpy as np
 
-def resample_row(row: np.ndarray, new_len: int) -> np.ndarray:
-    """Periodic down/up-sample by integer mapping (keeps wrap)."""
-    old_len = row.shape[0]
-    if old_len == new_len:
-        return row
-    idx = (np.arange(new_len) * old_len // new_len) % old_len
-    return row[idx]
+class Connection:
+    """A 1D 'worldline' connection between two nodes in the substrate."""
+    def __init__(self, a: int, b: int, energy: float = 0.0):
+        self.a = a          # endpoint index (node index in env/substrate)
+        self.b = b
+        self.energy = energy
+        self.age = 0
 
-def step_physics(prev_S: np.ndarray,
-                 env_row: np.ndarray,
-                 k_flux: float,
-                 k_motor: float,
-                 diffuse: float,
-                 decay: float,
-                 rng: np.random.Generator,
-                 band: int = 3) -> tuple[np.ndarray, float]:
-    """One local update step; returns (S_cur, flux_sum)."""
-    # diffusion (nearest neighbors on ring)
-    left  = np.roll(prev_S,  1)
-    right = np.roll(prev_S, -1)
-    S_diffused = prev_S + diffuse * (0.5*(left + right) - prev_S)
-    S_decayed  = (1.0 - decay) * S_diffused
+    def step(self,
+             env: np.ndarray,
+             k_absorb: float = 0.1,
+             k_convert: float = 0.05,
+             decay: float = 0.01,
+             noise_amp: float = 0.0,
+             rng: np.random.Generator | None = None) -> float:
+        """One update step for this connection."""
+        # sample free energy from environment at both ends
+        e_in = 0.5 * (env[self.a] + env[self.b])
+        e_abs = k_absorb * e_in
 
-    # boundary band pump
-    grad = np.maximum(env_row[:band] - S_decayed[:band], 0.0)
-    pump = np.zeros_like(S_decayed)
-    pump[:band] += k_flux * grad
+        # convert free → localized
+        self.energy += k_convert * e_abs
 
-    # motor exploration noise (boundary band only)
-    mot = np.zeros_like(S_decayed)
-    mot[:band] += k_motor * rng.random(band)
+        # decay (leakage back to free pool)
+        self.energy *= (1.0 - decay)
 
-    S_cur = S_decayed + pump + mot
-    flux_sum = float(np.sum(pump))
-    return S_cur, flux_sum
+        # random jitter for exploration
+        if rng is not None and noise_amp > 0:
+            self.energy += noise_amp * rng.standard_normal()
+
+        # aging
+        self.age += 1
+
+        return self.energy
+
+
+def step_physics(connections: list[Connection],
+                 env: np.ndarray,
+                 k_absorb: float = 0.1,
+                 k_convert: float = 0.05,
+                 decay: float = 0.01,
+                 noise_amp: float = 0.0,
+                 rng: np.random.Generator | None = None) -> np.ndarray:
+    """Update all connections once; return array of energies."""
+    return np.array([
+        c.step(env, k_absorb, k_convert, decay, noise_amp, rng)
+        for c in connections
+    ])
