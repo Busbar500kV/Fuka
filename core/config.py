@@ -5,13 +5,13 @@ from typing import List, Dict
 @dataclass
 class FieldCfg:
     length: int = 512
-    frames: int = 5000
+    frames: int = 1000
     noise_sigma: float = 0.01
     # sources: list of dicts, each like:
     # {"kind":"moving_peak","amp":1.0,"speed":0.10,"width":4.0,"start":24}
     sources: List[Dict] = field(default_factory=lambda: [
-        {"kind": "moving_peak", "amp": 1.0, "speed":  0.10, "width": 4.0, "start": 24},
-        {"kind": "moving_peak", "amp": 0.8, "speed": -0.07, "width": 6.0, "start": 144},
+        {"kind": "moving_peak", "amp": 1.0, "speed":  0.0, "width": 4.0, "start": 100}
+        # {"kind": "moving_peak", "amp": 0.8, "speed": -0.07, "width": 6.0, "start": 144},
     ])
 
 @dataclass
