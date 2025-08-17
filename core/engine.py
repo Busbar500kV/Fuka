@@ -124,7 +124,6 @@ class Engine:
             if self.conn_grow_every > 0 and (t % self.conn_grow_every == 0) and (t > 0):
                 grow_connections(
                     self.conn,
-                    X=self.X,
                     rng=self.rng,
                     budget=self.conn_grow_budget,
                 )
