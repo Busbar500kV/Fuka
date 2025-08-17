@@ -11,8 +11,7 @@ class FieldCfg:
     # {"kind":"moving_peak","amp":1.0,"speed":0.10,"width":4.0,"start":24}
     sources: List[Dict] = field(default_factory=lambda: [
         {"kind": "moving_peak", "amp": 1.0, "speed":  0.0, "width": 4.0, "start": 100}
-        # {"kind": "moving_peak", "amp": 0.8, "speed": -0.07, "width": 6.0, "start": 144},
-    ])
+        ])
 
 @dataclass
 class Config:
