@@ -49,6 +49,10 @@ class Engine:
         # Optional connections
         self.conn = None
         self.kernels = None
+        
+        self.conn_prune_age = getattr(cfg, "conn_prune_age", 25)         # or whatever you prefer
+        self.conn_prune_thresh = getattr(cfg, "conn_prune_thresh", 0.0)  # energy threshold
+        
         if _HAS_CONN:
             # Read connection-related knobs if present in cfg; otherwise use sensible defaults
             n_conn           = getattr(cfg, "n_conn", 64)
@@ -132,7 +136,7 @@ class Engine:
 
             # Periodic pruning
             if self.conn_prune_every > 0 and (t % self.conn_prune_every == 0) and (t > 0):
-                prune_connections(self.conn, thresh=self.conn_prune_thresh)
+                prune_connections(self.conn, min_age=self.conn_prune_age, energy_thresh=self.conn_prune_thresh)
                 self.kernels = gaussian_kernels(self.conn, self.X)
 
     # -------------------------------------------------------------------------
