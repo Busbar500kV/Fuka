@@ -6,11 +6,6 @@ import streamlit as st
 
 from core.config import default_config, make_config_from_dict
 from core.engine import Engine
-#from core.plot import (
-#    draw_energy_timeseries,
-#    draw_overlay_last_frame,
-#    draw_heatmap_full,
-#)
 from smooth_plot_helpers import (
     ensure_combo_fig,
     update_combo_fig,
@@ -129,12 +124,6 @@ def run_live():
             )
         
     engine.run(progress_cb=cb if live else None)
-
-    # Final refresh
-    # draw_energy_timeseries(ph_energy, engine.hist.t, engine.hist.E_cell, engine.hist.E_env, engine.hist.E_flux)
-    # draw_overlay_last_frame(ph_last, engine.env, engine.S)
-    # draw_heatmap_full(ph_combo, engine.env, engine.S, title="Environment E(t,x)")
-    # draw_heatmap_full(ph_sub_heat, engine.S,   title="Substrate S(t,x)")
 
     with ph_info:
         st.write("**Run complete**")
