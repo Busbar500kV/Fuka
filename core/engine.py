@@ -10,7 +10,7 @@ import numpy as np
 from .config import Config
 from .env import build_env
 from .organism import History
-from .physics import step_physics, resample_row
+# from .physics import step_physics, resample_row
 
 # --- Optional connections layer ---------------------------------------------
 _HAS_CONN = False
